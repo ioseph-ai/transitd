@@ -1,0 +1,17 @@
+version: "2"
+
+# Keep the trusted `standard` set (errcheck, govet, ineffassign, staticcheck,
+# unused) and add only linters relevant to a network agent that parses
+# external input, shells out to vtysh and exports Prometheus metrics.
+linters:
+  default: standard
+  enable:
+    - bodyclose
+    - gocritic
+    - gosec
+    - misspell
+    - promlinter
+
+formatters:
+  enable:
+    - gofumpt

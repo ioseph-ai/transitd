@@ -114,16 +114,17 @@ func (e *Engine) Evaluate(health []TransitHealth) Decision {
 	}
 
 	if switchCandidate != "" {
-		if e.State.Frozen {
+		switch {
+		case e.State.Frozen:
 			d.Frozen = true
 			d.Reason = "switch suppressed: rate-limit freeze"
-		} else if now.Sub(e.State.LastSwitch) < e.Cfg.Dwell {
+		case now.Sub(e.State.LastSwitch) < e.Cfg.Dwell:
 			d.Reason = "switch suppressed: dwell"
-		} else if e.State.SwitchHourWnd >= e.Cfg.MaxSwitches {
+		case e.State.SwitchHourWnd >= e.Cfg.MaxSwitches:
 			e.State.Frozen = true
 			d.Frozen = true
 			d.Reason = "switch suppressed: rate-limit freeze"
-		} else {
+		default:
 			d.Primary = switchCandidate
 			d.Switched = true
 			d.Reason = reason

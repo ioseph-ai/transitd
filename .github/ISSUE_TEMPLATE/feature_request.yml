@@ -1,0 +1,64 @@
+name: Feature request
+description: Suggest a capability or a change in behavior.
+title: "feature: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the idea. Please keep example values to documentation
+        ranges (`2001:db8::/32`, `192.0.2.0/24`, `198.51.100.0/24`,
+        AS 64496–64511) and redact anything real.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What are you trying to do that transitd does not let you do today? Describe the operational situation, not just the feature you have in mind.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: What would you like transitd to do? If it involves the decision/safety path, say how it should fail safe.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: What do you do today instead (manual failover, another tool, a config-management workaround)?
+    validations:
+      required: false
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      description: Which part of transitd does this concern?
+      options:
+        - Observation (BGP/BFD/probes)
+        - Gossip / mesh
+        - Decision & safety (quorum, hysteresis)
+        - Actuation (vtysh / route-maps)
+        - transitctl CLI
+        - Metrics / observability
+        - Config
+        - Packaging / CI / release
+        - Documentation
+        - Other
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: Checklist
+      options:
+        - label: I searched existing issues and this is not a duplicate.
+          required: true
+        - label: This request contains no real addresses, prefixes, ASNs, or secrets.
+          required: true

@@ -1,0 +1,99 @@
+# transitd integration lab — a tiny FRR topology used by the
+# `//go:build integration` tests under test/integration (issue #15).
+#
+#   r1 (AS64496) --iBGP-- r2 (AS64496)
+#    \
+#     --eBGP-- exabgp (AS64511), which announces 198.51.100.0/24 into r1
+#
+# Addresses are TEST-NET-1/2 (RFC 5737) and ASNs are from the documentation
+# ranges (RFC 5398 / RFC 6996) — nothing here points at production.
+#
+# Images are pinned by tag AND manifest-list digest. Resolve a new digest with:
+#   docker buildx imagetools inspect quay.io/frrouting/frr:10.7.1
+# Never use :latest and never Docker Hub frrouting/frr (the Docker Hub repo is
+# years stale and marked as moved — the published images live on Quay).
+#
+# Each link is its own docker bridge network with a /29 carved out of
+# TEST-NET-1, and every peer address sits below the bridge's gateway: docker
+# takes the first host address of the subnet (.1) for the bridge on the host
+# side, so a container configured at .1 collides with it ("Address already in
+# use"). Two /29s keep the two links separate and the addressing readable:
+#   link-r1r2  : 192.0.2.0/29  (r1 .2, r2 .3)
+#   link-r1exa : 192.0.2.8/29  (r1 .10, exa .11)
+
+name: transitd-integration
+
+services:
+  r1:
+    image: quay.io/frrouting/frr:10.7.1@sha256:e995beaa50fdc9edb35eadcfefa29b7f062cc06f2b812613789b68fa541554d2
+    hostname: r1
+    # FRR needs more than docker's default capability set: zebra/bgpd request
+    # CAP_NET_ADMIN, CAP_NET_RAW, CAP_SYS_ADMIN and CAP_NET_BIND_SERVICE at
+    # startup, and refuse to run without them (`privs_init: initial
+    # cap_set_proc failed: Operation not permitted`). These four are enough;
+    # no privileged mode is needed for a lab with directly-connected peers.
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+      - NET_BIND_SERVICE
+      - SYS_ADMIN
+    volumes:
+      - ./frr/daemons:/etc/frr/daemons:ro
+      - ./frr/vtysh.conf:/etc/frr/vtysh.conf:ro
+      - ./frr/r1/frr.conf:/etc/frr/frr.conf:ro
+    networks:
+      link-r1r2:
+        ipv4_address: 192.0.2.2
+      link-r1exa:
+        ipv4_address: 192.0.2.10
+    healthcheck:
+      test: ["CMD", "vtysh", "-c", "show version"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 5s
+
+  r2:
+    image: quay.io/frrouting/frr:10.7.1@sha256:e995beaa50fdc9edb35eadcfefa29b7f062cc06f2b812613789b68fa541554d2
+    hostname: r2
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+      - NET_BIND_SERVICE
+      - SYS_ADMIN
+    volumes:
+      - ./frr/daemons:/etc/frr/daemons:ro
+      - ./frr/vtysh.conf:/etc/frr/vtysh.conf:ro
+      - ./frr/r2/frr.conf:/etc/frr/frr.conf:ro
+    networks:
+      link-r1r2:
+        ipv4_address: 192.0.2.3
+    healthcheck:
+      test: ["CMD", "vtysh", "-c", "show version"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 5s
+
+  exabgp:
+    image: ghcr.io/exa-networks/exabgp:5.0.13@sha256:80f64719841fe6192f5b5a3b46edc27270215521438fae8a704f28d221a4680b
+    hostname: exabgp
+    # The image entrypoint is `exabgp`, so CMD is the config path.
+    command: ["/etc/exabgp/exabgp.conf"]
+    volumes:
+      - ./exabgp/exabgp.conf:/etc/exabgp/exabgp.conf:ro
+    networks:
+      link-r1exa:
+        ipv4_address: 192.0.2.11
+
+networks:
+  link-r1r2:
+    ipam:
+      driver: default
+      config:
+        - subnet: 192.0.2.0/29
+  link-r1exa:
+    ipam:
+      driver: default
+      config:
+        - subnet: 192.0.2.8/29

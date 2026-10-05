@@ -93,9 +93,6 @@ func (c *Config) Validate() error {
 	if c.Settle == 0 {
 		c.Settle = 60 * time.Second
 	}
-	if c.ProbeIntervalDefault() == 0 {
-		// per-transit default applied in ProbeIntervalDefault
-	}
 	if c.ListenMetrics == "" {
 		c.ListenMetrics = ":9414"
 	}

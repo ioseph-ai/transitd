@@ -1,0 +1,36 @@
+# FRR daemons file for the transitd integration lab.
+#
+# Mounted read-only at /etc/frr/daemons in every FRR container
+# (see test/compose.yaml). Only the daemons this lab needs are enabled;
+# watchfrr, zebra, staticd and mgmtd are always started by /usr/lib/frr/docker-start.
+#
+# bgpd is the only optional daemon enabled here. Do NOT enable daemons this
+# lab does not exercise: every extra one is another process that can fail to
+# converge inside the test timeout.
+bgpd=yes
+
+ospfd=no
+ospf6d=no
+ripd=no
+ripngd=no
+isisd=no
+pimd=no
+pim6d=no
+ldpd=no
+nhrpd=no
+eigrpd=no
+babeld=no
+sharpd=no
+pbrd=no
+bfdd=no
+fabricd=no
+vrrpd=no
+pathd=no
+
+# Load /etc/frr/frr.conf through vtysh on startup.
+vtysh_enable=yes
+
+# Keep the image defaults for the daemon listen addresses.
+zebra_options="  -A 127.0.0.1 -s 90000000"
+mgmtd_options="  -A 127.0.0.1"
+bgpd_options="   -A 127.0.0.1"

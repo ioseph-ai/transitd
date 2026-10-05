@@ -1,0 +1,117 @@
+name: Bug report
+description: Something in transitd does not work as documented.
+title: "bug: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file a bug.
+
+        **Before you post anything:** redact your configuration and logs.
+        Replace real addresses, prefixes, and ASNs with documentation values
+        (`2001:db8::/32`, `192.0.2.0/24`, `198.51.100.0/24`, AS 64496–64511).
+        Never paste your gossip key, WireGuard keys, passwords, or private
+        interface addresses. Issues are public.
+
+        If this is a **security** problem, stop — do not file it here. See
+        [SECURITY.md](https://github.com/ioseph-ai/transitd/blob/master/SECURITY.md).
+
+  - type: input
+    id: transitd-version
+    attributes:
+      label: transitd version
+      description: |
+        Release tag or `git describe` / commit SHA you are running.
+        Pre-1.0, so "latest" is not precise enough.
+      placeholder: "e.g. v0.1.0 or 57d5397"
+    validations:
+      required: true
+
+  - type: input
+    id: frr-vyos-version
+    attributes:
+      label: VyOS / FRR version
+      description: |
+        The FRR version (`vtysh -c 'show version'`) and, if you run VyOS,
+        the VyOS version. This matters — transitd parses FRR JSON output.
+      placeholder: "e.g. VyOS 1.4 / FRR 9.1"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform
+      description: What is transitd running on?
+      options:
+        - VyOS
+        - Linux + FRR
+        - Other (explain below)
+    validations:
+      required: true
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What did you expect, and what did you observe instead?
+    validations:
+      required: true
+
+  - type: textarea
+    id: config
+    attributes:
+      label: Redacted configuration
+      description: |
+        The relevant part of the agent's YAML config. **Redact it first** —
+        documentation ranges only, and delete the gossip/session keys.
+      render: yaml
+      placeholder: |
+        # redacted example
+        transits:
+          - name: transit-a
+            next_hop: 192.0.2.1
+    validations:
+      required: false
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Log excerpt
+      description: |
+        The relevant log lines. Redact addresses/ASNs and secrets. Note
+        whether the agent was in observe-only or acting mode.
+      render: text
+    validations:
+      required: false
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: How can we make this happen? Include the `transitctl` commands and their output if relevant.
+      placeholder: |
+        1.
+        2.
+        3.
+    validations:
+      required: true
+
+  - type: input
+    id: last-known-good
+    attributes:
+      label: Did this work in a previous version?
+      description: If you can bisect, note the last version that behaved correctly.
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: Checklist
+      options:
+        - label: I have redacted all real addresses, prefixes, ASNs, and secrets from this report.
+          required: true
+        - label: This is not a security vulnerability (those go through SECURITY.md).
+          required: true

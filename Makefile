@@ -42,9 +42,10 @@ integration:
 		echo "integration: test/compose.yaml not found — the integration-tier PR has not landed yet"; \
 		exit 1; \
 	fi
-	docker compose -f test/compose.yaml up -d --wait
-	$(GO) test -tags=integration -count=1 $(PKG); status=$$?; \
-	docker compose -f test/compose.yaml down -v; exit $$status
+	@set -e; \
+	trap 'docker compose -f test/compose.yaml down -v' EXIT; \
+	docker compose -f test/compose.yaml up -d --wait; \
+	$(GO) test -tags=integration -count=1 $(PKG)
 
 # lint runs golangci-lint with the repo config (.golangci.yml).
 lint:
@@ -58,14 +59,20 @@ fmt:
 vulncheck:
 	$(GOVULNCHECK) $(PKG)
 
-# golden-update regenerates golden vtysh batches. Until golden tests exist
-# the test run matches nothing, so we report that instead of failing.
+# golden-update regenerates golden vtysh batches. Detect the "no golden tests
+# yet" case explicitly and report it; a real TestGolden failure still fails.
 golden-update:
-	UPDATE_GOLDEN=1 $(GO) test $(PKG) -run TestGolden || echo "no golden tests yet"
+	@if [[ "$$($(GO) test $(PKG) -list 'TestGolden' 2>/dev/null | grep -c '^TestGolden')" -eq 0 ]]; then \
+		echo "no golden tests yet"; \
+	else \
+		UPDATE_GOLDEN=1 $(GO) test $(PKG) -run TestGolden; \
+	fi
 
-# release-dry builds a goreleaser snapshot locally (never publishes).
+# release-dry builds a goreleaser snapshot locally (never publishes). Report
+# it as unavailable only when the tool is missing; a failed build still fails.
 release-dry:
-	$(GORELEASER) release --snapshot --clean || echo "goreleaser not installed"
+	@command -v $(GORELEASER) >/dev/null 2>&1 || { echo "goreleaser not installed"; exit 0; }; \
+	$(GORELEASER) release --snapshot --clean
 
 clean:
 	$(GO) clean

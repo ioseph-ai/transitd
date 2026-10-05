@@ -60,9 +60,11 @@ vulncheck:
 	$(GOVULNCHECK) $(PKG)
 
 # golden-update regenerates golden vtysh batches. Detect the "no golden tests
-# yet" case explicitly and report it; a real TestGolden failure still fails.
+# yet" case explicitly and report it; a real TestGolden failure still fails,
+# and a discovery failure (go test -list) propagates instead of reading as 0.
 golden-update:
-	@if [[ "$$($(GO) test $(PKG) -list 'TestGolden' 2>/dev/null | grep -c '^TestGolden')" -eq 0 ]]; then \
+	@list="$$($(GO) test $(PKG) -list 'TestGolden')" || exit $$?; \
+	if [[ "$$(printf '%s\n' "$$list" | grep -c '^TestGolden')" -eq 0 ]]; then \
 		echo "no golden tests yet"; \
 	else \
 		UPDATE_GOLDEN=1 $(GO) test $(PKG) -run TestGolden; \

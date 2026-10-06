@@ -24,6 +24,17 @@ gossip:
 
 listen_metrics: ":9414"
 
+# Local control channel (issue #2): the unix socket `transitctl` talks to. It is
+# authenticated with the gossip shared key above, so it exists only when a mesh
+# key is set — an agent with no key opens no control socket at all. The channel is
+# local-only in this MVP; remote invocation over the gossip mesh is documented as
+# the reserved extension in internal/ctrl/PROTOCOL.md.
+#
+# The socket's directory is created 0750 and the socket 0660, owned by the agent's
+# user (root). Omit this block to use the default /run/transitd/ctrl.sock.
+control:
+  socket_path: /run/transitd/ctrl.sock
+
 # Decision tuning (all optional; the shown values are the defaults).
 margin_ms: 10
 win_cycles: 3

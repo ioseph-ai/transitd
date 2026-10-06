@@ -125,6 +125,37 @@ var (
 		Name:      "gossip_schema_rx",
 		Help:      "Gossip health messages received, by envelope schema_version.",
 	}, []string{LabelSchemaVersion})
+
+	// CtrlAuthFail counts control-channel requests rejected for a missing or
+	// wrong shared key. It is the security signal an operator watches: a steady
+	// trickle is a misconfigured local client, a burst is something else probing
+	// the socket. It is a counter, not a gauge, because "how many" is the
+	// question; every failure is also audit-logged with the peer's identity.
+	CtrlAuthFail = prometheus.NewCounter(prometheus.CounterOpts{ //nolint:promlinter // name fixed by issue #2's metric contract
+		Namespace: namespace,
+		Name:      "ctrl_auth_fail",
+		Help:      "Control-channel requests rejected for a missing or wrong shared key.",
+	})
+
+	// CtrlRateLimited counts control-channel requests shed by the per-method
+	// token bucket. A client that sees this is retrying too fast; it is not an
+	// auth failure and must be distinguishable from one.
+	CtrlRateLimited = prometheus.NewCounter(prometheus.CounterOpts{ //nolint:promlinter // name fixed by issue #2's metric contract
+		Namespace: namespace,
+		Name:      "ctrl_rate_limited",
+		Help:      "Control-channel requests rejected by the per-method rate limit (not an auth failure).",
+	})
+
+	// CtrlSetPrimary records the last desired-primary preference requested over
+	// the control channel, as a gauge holding the desired rank: 1 for the transit
+	// the operator named, 0 for every other configured transit. Observe-only in
+	// this MVP — the agent records and logs the preference but applies nothing
+	// (issue #4), so this metric is the durable record that the request arrived.
+	CtrlSetPrimary = prometheus.NewGaugeVec(prometheus.GaugeOpts{ //nolint:promlinter // name fixed by issue #2's metric contract
+		Namespace: namespace,
+		Name:      "ctrl_set_primary",
+		Help:      "Desired primary preference set over the control channel: 1 for the requested transit, 0 otherwise. Observe-only: not applied.",
+	}, []string{LabelTransit})
 )
 
 var registerOnce sync.Once
@@ -138,6 +169,7 @@ func Register() error {
 		for _, c := range []prometheus.Collector{
 			PinVerified, ProbeLatencyMs, ProbeLossPct, DecisionsTotal,
 			GossipMembers, GossipRx, GossipTx, GossipSchemaRx,
+			CtrlAuthFail, CtrlRateLimited, CtrlSetPrimary,
 		} {
 			rerr := Registry.Register(c)
 			if rerr == nil {

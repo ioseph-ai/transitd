@@ -72,6 +72,11 @@ changes; treat the key like an SSH key.
 ## CI policy
 
 - Unit tests for decide/act/metrics (table-driven, golden vtysh batches).
+- The decide ranking engine keeps a byte-exact golden baseline under
+  `internal/decide/testdata/golden/decide`, enforced by `TestGoldenDecide`
+  (`make golden-update` regenerates deliberately). See
+  [ci.md](ci.md#decision-goldens); every decide-touching PR must update it on
+  purpose, and CI fails on an unexpected diff.
 - Integration tests against FRR containers (docker compose: 3 frr
   containers + vtysh socket wiring) exercising: election, hysteresis,
   quorum freeze, drift repair, soft-clear batching.

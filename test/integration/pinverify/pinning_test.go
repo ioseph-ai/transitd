@@ -286,7 +286,14 @@ func (l *lab) deleteRule(t *testing.T, fam, src string) {
 
 func (l *lab) addRoute(t *testing.T, fam, target, iface string, table int) {
 	t.Helper()
-	l.ip(t, fam, "route", "replace", target+"/32", "dev", iface, "table", itoa(table))
+	// The target route must be a host route: /32 for v4, /128 for v6. A /32 on an
+	// IPv6 target would install 2001:db8::/32 — a prefix that contains the source
+	// addresses themselves, collapsing the scenario.
+	prefix := "32"
+	if l.v6 {
+		prefix = "128"
+	}
+	l.ip(t, fam, "route", "replace", target+"/"+prefix, "dev", iface, "table", itoa(table))
 }
 
 func (l *lab) flushTable(t *testing.T, fam string) {

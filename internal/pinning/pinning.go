@@ -69,11 +69,13 @@ type ExecRunner struct {
 	Binary string
 }
 
-// Lookup runs <Binary> with args and returns its combined stdout+stderr.
-func (r ExecRunner) Lookup(ctx context.Context, _ string, args ...string) (string, error) {
+// Lookup runs the route-lookup program with args and returns its combined
+// stdout+stderr. When Binary is empty the caller-supplied name is used (the
+// verifier passes "ip").
+func (r ExecRunner) Lookup(ctx context.Context, name string, args ...string) (string, error) {
 	bin := r.Binary
 	if bin == "" {
-		bin = "ip"
+		bin = name
 	}
 	out, err := exec.CommandContext(ctx, bin, args...).CombinedOutput() //nolint:gosec // fixed binary, argv slice, no shell
 	return string(out), err

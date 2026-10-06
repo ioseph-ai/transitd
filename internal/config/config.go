@@ -107,8 +107,14 @@ func (c *Config) Validate() error {
 		if t.ProbeTarget == "" {
 			return fmt.Errorf("transit %q: probe_target is required", t.Name)
 		}
-		if net.ParseIP(t.ProbeTarget) == nil {
+		if ip := net.ParseIP(t.ProbeTarget); ip == nil {
 			return fmt.Errorf("transit %q: probe_target %q is not an IP", t.Name, t.ProbeTarget)
+		} else if src := net.ParseIP(t.ProbeSource); (src.To4() != nil) != (ip.To4() != nil) {
+			// A v4 source with a v6 target (or the reverse) cannot be pinned:
+			// the source selects a policy route within its own family, and the
+			// kernel would refuse `ip route get <v6> from <v4>`. Rejecting it
+			// here turns a per-cycle exec failure into a startup error.
+			return fmt.Errorf("transit %q: probe_source %q and probe_target %q are from different address families", t.Name, t.ProbeSource, t.ProbeTarget)
 		}
 		if t.EgressInterface == "" {
 			return fmt.Errorf("transit %q: egress_interface is required (expected egress for pin verification)", t.Name)
@@ -121,8 +127,12 @@ func (c *Config) Validate() error {
 				return fmt.Errorf("transit %q: probe target %q is not an IP", t.Name, tgt)
 			}
 		}
-		if t.ProbeInterval == 0 {
-			t.ProbeInterval = c.ProbeIntervalDefault()
+	}
+	// Defaults for per-transit optional tuning. Applied only after every transit
+	// has passed validation, so a rejected config is never partially mutated.
+	for i := range c.Transits {
+		if c.Transits[i].ProbeInterval == 0 {
+			c.Transits[i].ProbeInterval = c.ProbeIntervalDefault()
 		}
 	}
 	// Defaults for optional tuning.

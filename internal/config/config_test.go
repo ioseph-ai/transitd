@@ -62,6 +62,14 @@ func TestValidateErrors(t *testing.T) {
 		{"bad probe target", func(c *Config) { c.Transits[0].ProbeTarget = "not-an-ip" }, "probe_target \"not-an-ip\" is not an IP"},
 		{"missing egress interface", func(c *Config) { c.Transits[0].EgressInterface = "" }, "egress_interface is required"},
 		{"bad egress interface", func(c *Config) { c.Transits[0].EgressInterface = "eth 0" }, "not a valid interface name"},
+		{"cross-family source/target", func(c *Config) {
+			c.Transits[0].ProbeSource = "192.0.2.1"
+			c.Transits[0].ProbeTarget = "2001:db8::5"
+		}, "different address families"},
+		{"cross-family source/target (reverse)", func(c *Config) {
+			c.Transits[0].ProbeSource = "2001:db8::1"
+			c.Transits[0].ProbeTarget = "192.0.2.5"
+		}, "different address families"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -91,6 +99,22 @@ func TestProbeDefaultsAreApplied(t *testing.T) {
 	}
 	if got := c.Transits[1].ProbeInterval; got != 90*time.Second {
 		t.Errorf("transit b probe_interval = %v, want preserved 90s", got)
+	}
+}
+
+// TestValidateRejectsWithoutPartialMutation pins that a config which fails
+// validation is not left half-defaulted: per-transit defaults are applied only
+// once every transit has passed. A caller that logs a rejected config must not
+// see it look partly valid.
+func TestValidateRejectsWithoutPartialMutation(t *testing.T) {
+	c := base()
+	// The first transit is valid and has no interval; the second is broken.
+	c.Transits[1].ProbeTarget = "not-an-ip"
+	if err := c.Validate(); err == nil {
+		t.Fatal("expected a validation error")
+	}
+	if got := c.Transits[0].ProbeInterval; got != 0 {
+		t.Errorf("rejected config was mutated: transit a probe_interval = %v, want 0", got)
 	}
 }
 

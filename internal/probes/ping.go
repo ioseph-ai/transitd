@@ -167,14 +167,21 @@ type Runner interface {
 
 // ExecRunner is the production Runner.
 type ExecRunner struct {
-	// Binary is the ping program; defaults to "ping" when empty.
+	// Binary overrides the program the caller names in Run (the loop passes
+	// "ping"). It exists so a host with ping at a nonstandard path — or a test
+	// exercising a specific busybox binary — can point the runner at it. Empty
+	// means "use the name the caller passed".
 	Binary string
 }
 
 // Run execs the ping binary directly (never through a shell — the source
 // address and target come from config and must not be word-split).
 func (r ExecRunner) Run(ctx context.Context, name string, args ...string) (string, string, int, error) {
-	cmd := exec.CommandContext(ctx, name, args...) //nolint:gosec // fixed binary + argv slice, no shell
+	bin := r.Binary
+	if bin == "" {
+		bin = name
+	}
+	cmd := exec.CommandContext(ctx, bin, args...) //nolint:gosec // fixed binary + argv slice, no shell
 	var stdout, stderr strings.Builder
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr

@@ -172,6 +172,43 @@ func TestParseRejectsBareIntegerDuration(t *testing.T) {
 	}
 }
 
+// TestParseRejectsNegativeDuration is the second half of the guard: a negative
+// duration is not merely nonsensical, it silently disables a guard. decide's dwell
+// check is `now.Sub(last) < Dwell`, which a negative Dwell makes never true, and a
+// negative probe_interval is silently replaced with 30s by NewLoop. Both are the
+// silently-wrong class the loader exists to refuse.
+func TestParseRejectsNegativeDuration(t *testing.T) {
+	const transit = `transits:
+  - name: main
+    import_map: MAIN-LOCAL-IN
+    probe_source: 192.0.2.1
+    probe_target: 198.51.100.5
+    egress_interface: eth-transit
+`
+	cases := []struct {
+		name string
+		doc  string
+	}{
+		{"top-level dwell", "router_name: r-example\nbind_addr: 192.0.2.10\ndwell: -5m\n" + transit},
+		{"top-level settle", "router_name: r-example\nbind_addr: 192.0.2.10\nsettle: -1s\n" + transit},
+		{
+			"per-transit probe_interval",
+			"router_name: r-example\nbind_addr: 192.0.2.10\n" + transit + "    probe_interval: -30s\n",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := errFromParse([]byte(tc.doc))
+			if err == nil {
+				t.Fatal("expected an error for a negative duration")
+			}
+			if !strings.Contains(err.Error(), "negative") {
+				t.Errorf("error %q does not say the duration is negative", err)
+			}
+		})
+	}
+}
+
 // TestParseAcceptsDurationStrings is the positive half of the guard above: a
 // well-formed duration must not be caught by it.
 func TestParseAcceptsDurationStrings(t *testing.T) {

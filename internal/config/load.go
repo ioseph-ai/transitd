@@ -58,27 +58,41 @@ func Parse(b []byte) (*Config, error) {
 	return &c, nil
 }
 
-// validateDurations rejects a duration field that was explicitly set below the
-// plausible floor. Fields left unset (or explicitly zero, meaning "use the
-// default") are untouched: only a nonzero value that is implausibly small is a
-// configuration bug. It runs before Validate so the message is about the value
-// the operator wrote, not about a downstream default.
+// validateDurations rejects a duration field that was explicitly set to a value
+// that cannot mean what the operator intended. Two classes are refused:
+//
+//   - negative values. Some are merely nonsensical (`dwell: -5m`), but they do
+//     damage: decide's dwell guard is `now.Sub(last) < Dwell`, which a negative
+//     Dwell makes never true, silently turning the guard off. A negative
+//     `probe_interval` is silently replaced with the 30s default by NewLoop. Both
+//     are the silently-wrong class, so they are refused here rather than
+//     interpreted.
+//   - nonzero values below a plausible floor. `time.Duration` is an int64 and the
+//     decoder maps a bare integer to nanoseconds, so `probe_interval: 30` is 30ns,
+//     not 30s.
+//
+// Fields left unset (or explicitly zero, meaning "use the default") are
+// untouched. It runs before Validate so the message is about the value the
+// operator wrote, not about a downstream default.
 func (c *Config) validateDurations() error {
-	fields := []struct {
-		name string
-		val  time.Duration
-	}{
-		{"dwell", c.Dwell},
-		{"settle", c.Settle},
-	}
-	for _, f := range fields {
-		if f.val > 0 && f.val < minPlausibleDuration {
-			return fmt.Errorf("%s: %v is implausibly small — durations use Go syntax (e.g. 30s, 5m), and a bare integer is read as nanoseconds", f.name, f.val)
+	check := func(name string, v time.Duration) error {
+		switch {
+		case v < 0:
+			return fmt.Errorf("%s: %v is negative — a negative duration is not a value transitd can honour (decide's dwell guard would be silently disabled)", name, v)
+		case v > 0 && v < minPlausibleDuration:
+			return fmt.Errorf("%s: %v is implausibly small — durations use Go syntax (e.g. 30s, 5m), and a bare integer is read as nanoseconds", name, v)
 		}
+		return nil
+	}
+	if err := check("dwell", c.Dwell); err != nil {
+		return err
+	}
+	if err := check("settle", c.Settle); err != nil {
+		return err
 	}
 	for i := range c.Transits {
-		if v := c.Transits[i].ProbeInterval; v > 0 && v < minPlausibleDuration {
-			return fmt.Errorf("transit %q: probe_interval: %v is implausibly small — durations use Go syntax (e.g. 30s), and a bare integer is read as nanoseconds", c.Transits[i].Name, v)
+		if err := check(fmt.Sprintf("transit %q: probe_interval", c.Transits[i].Name), c.Transits[i].ProbeInterval); err != nil {
+			return err
 		}
 	}
 	return nil

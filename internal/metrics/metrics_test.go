@@ -39,6 +39,22 @@ func gaugeValue(t *testing.T, fam *dto.MetricFamily, transit string) (float64, b
 	return 0, false
 }
 
+// featureValue returns the value of the series with the given feature label.
+func featureValue(t *testing.T, fam *dto.MetricFamily, feature string) (float64, bool) {
+	t.Helper()
+	if fam == nil {
+		return 0, false
+	}
+	for _, m := range fam.GetMetric() {
+		for _, lp := range m.GetLabel() {
+			if lp.GetName() == LabelFeature && lp.GetValue() == feature {
+				return m.GetGauge().GetValue(), true
+			}
+		}
+	}
+	return 0, false
+}
+
 // TestRegisterIsIdempotent asserts Register can be called any number of times —
 // the agent's startup path and a test both call it — without a duplicate
 // registration error.
@@ -148,13 +164,50 @@ func TestDecisionsCounterAuditTriple(t *testing.T) {
 	}
 }
 
+// TestFeatureStateGauge is the metrics half of issue #5: feature_state carries
+// the numeric contract (0 enabled, 1 degraded, 2 disabled) under the feature
+// label, and is a gauge so a recovered feature can go back to 0 — a counter
+// could only ever climb and would make "is it broken right now" unanswerable.
+func TestFeatureStateGauge(t *testing.T) {
+	if err := Register(); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	SetFeatureState("probes", FeatureStateEnabled)
+	SetFeatureState("gossip", FeatureStateDegraded)
+	SetFeatureState("act", FeatureStateDisabled)
+
+	fam := gather(t)["transitd_feature_state"]
+	if fam == nil {
+		t.Fatal("transitd_feature_state not exported")
+	}
+	if fam.GetType().String() != "GAUGE" {
+		t.Errorf("transitd_feature_state type = %s, want GAUGE", fam.GetType())
+	}
+	for name, want := range map[string]float64{
+		"probes": FeatureStateEnabled,
+		"gossip": FeatureStateDegraded,
+		"act":    FeatureStateDisabled,
+	} {
+		if v, ok := featureValue(t, fam, name); !ok || v != want {
+			t.Errorf("feature_state{%s} = %v (present=%t), want %v", name, v, ok, want)
+		}
+	}
+	// A feature can recover, and the gauge must follow. Re-gather: a gathered
+	// family is a snapshot, so a stale value would be indistinguishable from a
+	// gauge that never moved.
+	SetFeatureState("gossip", FeatureStateEnabled)
+	if v, _ := featureValue(t, gather(t)["transitd_feature_state"], "gossip"); v != FeatureStateEnabled {
+		t.Errorf("feature_state{gossip} = %v after recovery, want %v", v, FeatureStateEnabled)
+	}
+}
+
 // TestMetricNamesAreNamespaced is a cheap regression guard on the operator-facing
 // contract: every metric this package registers is under the transitd_ prefix.
 func TestMetricNamesAreNamespaced(t *testing.T) {
 	if err := Register(); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
-	for _, c := range []prometheus.Collector{PinVerified, ProbeLatencyMs, ProbeLossPct, DecisionsTotal} {
+	for _, c := range []prometheus.Collector{PinVerified, ProbeLatencyMs, ProbeLossPct, DecisionsTotal, FeatureState} {
 		desc := make(chan *prometheus.Desc, 1)
 		c.Describe(desc)
 		close(desc)

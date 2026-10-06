@@ -31,6 +31,22 @@ const (
 	LabelReason = "reason"
 )
 
+// LabelFeature is the label on the feature-state gauge: the capability's name
+// as registered in internal/health (issue #5). It is deliberately not a fixed
+// enum here — the registry is generic and a new subsystem adds a feature
+// without this package changing.
+const LabelFeature = "feature"
+
+// Feature-state gauge values, per issue #5's contract.
+const (
+	// FeatureStateEnabled is 0: the capability is working.
+	FeatureStateEnabled = 0
+	// FeatureStateDegraded is 1: the capability is impaired but still running.
+	FeatureStateDegraded = 1
+	// FeatureStateDisabled is 2: the capability has turned itself off.
+	FeatureStateDisabled = 2
+)
+
 // Registry is the collector registry transitd exports. It is separate from
 // prometheus.DefaultRegisterer so tests can construct an isolated registry and
 // so the agent can add Go/process collectors explicitly rather than inheriting
@@ -78,6 +94,18 @@ var (
 		Name:      "decisions_total",
 		Help:      "Decisions that would change the rank-1 transit, by from/to/reason. Observe-only: not applied.",
 	}, []string{LabelFrom, LabelTo, LabelReason})
+
+	// FeatureState is the current state of every registered feature (issue #5),
+	// keyed by feature name: 0 enabled, 1 degraded, 2 disabled. It is a gauge,
+	// not a counter, because the question an operator asks is "what is broken
+	// right now", and because a feature can return to enabled. The registry in
+	// internal/health is the writer; this is the operator-side surface of the
+	// same fact the healthz payload reports.
+	FeatureState = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: namespace,
+		Name:      "feature_state",
+		Help:      "State of a feature capability: 0=enabled, 1=degraded, 2=disabled. Reason is on the healthz payload and the log line.",
+	}, []string{LabelFeature})
 )
 
 var registerOnce sync.Once
@@ -88,7 +116,7 @@ var registerOnce sync.Once
 func Register() error {
 	var err error
 	registerOnce.Do(func() {
-		for _, c := range []prometheus.Collector{PinVerified, ProbeLatencyMs, ProbeLossPct, DecisionsTotal} {
+		for _, c := range []prometheus.Collector{PinVerified, ProbeLatencyMs, ProbeLossPct, DecisionsTotal, FeatureState} {
 			rerr := Registry.Register(c)
 			if rerr == nil {
 				continue
@@ -133,4 +161,13 @@ func SetProbeLossOnly(transit string, lossPct float64) {
 func ClearProbe(transit string) {
 	ProbeLatencyMs.DeleteLabelValues(transit)
 	ProbeLossPct.DeleteLabelValues(transit)
+}
+
+// SetFeatureState exports one feature capability's current state as
+// transitd_feature_state{feature}. state is the numeric contract from issue #5
+// (FeatureStateEnabled/Degraded/Disabled). The registry in internal/health is
+// the only caller: keeping the write behind one setter means the gauge can
+// never disagree with the healthz payload about what a feature is doing.
+func SetFeatureState(feature string, state int) {
+	FeatureState.WithLabelValues(feature).Set(float64(state))
 }

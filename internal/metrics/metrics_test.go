@@ -154,7 +154,7 @@ func TestMetricNamesAreNamespaced(t *testing.T) {
 	if err := Register(); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
-	for _, c := range []prometheus.Collector{PinVerified, ProbeLatencyMs, ProbeLossPct, DecisionsTotal} {
+	for _, c := range []prometheus.Collector{PinVerified, ProbeLatencyMs, ProbeLossPct, DecisionsTotal, ActOps} {
 		desc := make(chan *prometheus.Desc, 1)
 		c.Describe(desc)
 		close(desc)

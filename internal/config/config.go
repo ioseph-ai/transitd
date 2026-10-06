@@ -31,7 +31,35 @@ type Transit struct {
 	// multi-target probe work and is validated when set.
 	ProbeTargets []string `yaml:"probe_targets"`
 
+	// ProbeInterval bounds one transit's probe cadence; default 30s.
 	ProbeInterval time.Duration `yaml:"probe_interval"` // default 30s
+
+	// BGPNeighbor is the BGP peer address of this transit's upstream, as it
+	// appears in `show bgp summary json` on this router. It is what lets
+	// bgpwatch attribute a session state to a transit (issue #4): without it the
+	// agent can measure a transit's latency but cannot say whether its session
+	// is up. Empty means "not BGP-observed" and the transit keeps its probe-only
+	// health view.
+	BGPNeighbor string `yaml:"bgp_neighbor"`
+}
+
+// BGPWatchConfig configures vtysh JSON polling of BGP session and prefix state
+// (issue #4). Polling is bounded and read-only: it issues `show` commands only,
+// so it can never be the thing that changes a router.
+type BGPWatchConfig struct {
+	// Enabled turns the poller on. Off by default, like every other capability.
+	Enabled bool `yaml:"enabled"`
+
+	// MaxPrefixes caps how many prefixes a prefix-level view will parse. A table
+	// larger than this is an ERROR, never a silent truncation: a truncated RIB
+	// would make "does peer X see prefix P" answer a confident no about a prefix
+	// it simply did not read. Default 1000.
+	MaxPrefixes int `yaml:"max_prefixes"`
+
+	// Interval is the poll cadence. It is floored at 1s — bgpwatch may never poll
+	// faster than 1 Hz, because `show bgp ... json` on a full table is a
+	// non-trivial CPU and memory cost on a 1 vCPU router.
+	Interval time.Duration `yaml:"interval"`
 }
 
 // Config is the full agent configuration.
@@ -56,6 +84,10 @@ type Config struct {
 
 	Transits []Transit `yaml:"transits"`
 
+	// BGPWatch controls vtysh JSON polling of BGP session + prefix state
+	// (issue #4).
+	BGPWatch BGPWatchConfig `yaml:"bgpwatch"`
+
 	ListenMetrics string `yaml:"listen_metrics"` // default :9414
 }
 
@@ -65,6 +97,18 @@ type Config struct {
 // control characters is a configuration bug we refuse at startup rather than
 // discover as a confusing exec failure later.
 var egressInterfaceRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.:@-]*$`)
+
+// Defaults and floors for bgpwatch (issue #4). They live here, next to the
+// struct they default, so the poller and the validator cannot disagree.
+const (
+	// DefaultBGPWatchInterval is the default BGP JSON poll cadence.
+	DefaultBGPWatchInterval = 5 * time.Second
+	// MinBGPWatchInterval is the hard 1 Hz poll floor. Nothing may poll BGP
+	// faster than this, whatever the config says.
+	MinBGPWatchInterval = 1 * time.Second
+	// DefaultMaxPrefixes is the default cap on parsed prefixes per view.
+	DefaultMaxPrefixes = 1000
+)
 
 // Validate checks structural invariants. It deliberately rejects anything
 // the agent cannot apply safely at runtime.
@@ -127,6 +171,13 @@ func (c *Config) Validate() error {
 				return fmt.Errorf("transit %q: probe target %q is not an IP", t.Name, tgt)
 			}
 		}
+		// bgp_neighbor is optional, but a set one must be an address: it is the
+		// key bgpwatch matches against `show bgp summary json`, so a hostname or a
+		// typo would silently never match and the transit would report no session
+		// state rather than a startup error naming the bad value.
+		if t.BGPNeighbor != "" && net.ParseIP(t.BGPNeighbor) == nil {
+			return fmt.Errorf("transit %q: bgp_neighbor %q is not an IP", t.Name, t.BGPNeighbor)
+		}
 	}
 	// Defaults for per-transit optional tuning. Applied only after every transit
 	// has passed validation, so a rejected config is never partially mutated.
@@ -134,6 +185,29 @@ func (c *Config) Validate() error {
 		if c.Transits[i].ProbeInterval == 0 {
 			c.Transits[i].ProbeInterval = c.ProbeIntervalDefault()
 		}
+	}
+	// bgpwatch (issue #4). A prefix cap of 0 means "unspecified" -> default. A
+	// negative cap is refused rather than interpreted: it can only come from a
+	// typo, and treating it as "unlimited" would remove the bound that stops a
+	// full-table parse from hammering a 1 vCPU router.
+	if c.BGPWatch.MaxPrefixes < 0 {
+		return fmt.Errorf("bgpwatch.max_prefixes: %d is negative — a prefix cap is a positive bound", c.BGPWatch.MaxPrefixes)
+	}
+	if c.BGPWatch.MaxPrefixes == 0 {
+		c.BGPWatch.MaxPrefixes = DefaultMaxPrefixes
+	}
+	// The 1 Hz floor is a property of the poller, not a preference: `show bgp
+	// ... json` on a full table is expensive, and a sub-second cadence multiplies
+	// that cost by an integer factor without adding resolution anyone reads. A
+	// configured interval below the floor is clamped, and an unset one takes the
+	// default. Clamping (rather than rejecting) keeps an operator who writes
+	// `interval: 100ms` from getting a config error for asking for "as fast as
+	// allowed".
+	if c.BGPWatch.Interval == 0 {
+		c.BGPWatch.Interval = DefaultBGPWatchInterval
+	}
+	if c.BGPWatch.Interval < MinBGPWatchInterval {
+		c.BGPWatch.Interval = MinBGPWatchInterval
 	}
 	// Defaults for optional tuning.
 	if c.BaseLP == 0 {

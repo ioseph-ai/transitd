@@ -1,0 +1,64 @@
+{
+  "ipv4Unicast": {
+    "routerId": "192.0.2.2",
+    "as": 64496,
+    "vrfId": 0,
+    "vrfName": "default",
+    "tableVersion": 3,
+    "ribCount": 1,
+    "peerCount": 2,
+    "peers": {
+      "192.0.2.3": {
+        "hostname": "r2",
+        "softwareVersion": "FRRouting/10.7.1_git",
+        "remoteAs": 64496,
+        "localAs": 64496,
+        "version": 4,
+        "msgRcvd": 4,
+        "msgSent": 5,
+        "outq": 0,
+        "inq": 0,
+        "peerUptime": "00:00:06",
+        "peerUptimeMsec": 6000,
+        "peerUptimeEstablishedEpoch": 0,
+        "pfxRcd": 0,
+        "pfxSnt": 0,
+        "state": "Idle (Admin)",
+        "peerState": "Idle",
+        "connectionsEstablished": 1,
+        "connectionsDropped": 0,
+        "desc": "r2 (iBGP)",
+        "idType": "ipv4"
+      },
+      "192.0.2.11": {
+        "hostname": "exabgp",
+        "softwareVersion": "n/a",
+        "remoteAs": 64511,
+        "localAs": 64496,
+        "version": 4,
+        "msgRcvd": 12,
+        "msgSent": 13,
+        "outq": 0,
+        "inq": 0,
+        "peerUptime": "00:00:47",
+        "peerUptimeMsec": 47000,
+        "peerUptimeEstablishedEpoch": 1791314300,
+        "pfxRcd": 1,
+        "pfxSnt": 2,
+        "state": "Established",
+        "peerState": "OK",
+        "connectionsEstablished": 1,
+        "connectionsDropped": 0,
+        "desc": "exabgp (eBGP injector)",
+        "idType": "ipv4"
+      }
+    },
+    "failedPeers": 1,
+    "displayedPeers": 2,
+    "totalPeers": 2,
+    "dynamicPeers": 0,
+    "bestPath": {
+      "multiPathRelax": "false"
+    }
+  }
+}

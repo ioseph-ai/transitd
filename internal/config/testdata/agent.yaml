@@ -32,6 +32,10 @@ transits:
     # The egress the probes must actually leave through (assertion target).
     egress_interface: eth-transit
     probe_interval: 30s
+    # This transit's upstream BGP peer, as it appears in `show bgp summary
+    # json` on this router. It is what lets bgpwatch attribute a session state
+    # to the transit; unset means the transit keeps its probe-only health view.
+    bgp_neighbor: 198.51.100.5
 
   - name: backup
     import_map: BACKUP-LOCAL-IN
@@ -39,3 +43,15 @@ transits:
     probe_target: 198.51.100.6
     egress_interface: eth-backup
     probe_interval: 30s
+    bgp_neighbor: 198.51.100.6
+
+# BGP/BFD state polling over vtysh (read-only `show` commands; 1 Hz max).
+bgpwatch:
+  enabled: true
+  # A prefix-level view larger than this is an error, never a silent
+  # truncation (a partial RIB would make "does peer X see prefix P" answer a
+  # confident no).
+  max_prefixes: 1000
+  # Poll cadence; floored at 1s regardless of what is written here.
+  interval: 5s
+

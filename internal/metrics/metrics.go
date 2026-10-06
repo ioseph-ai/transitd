@@ -31,6 +31,20 @@ const (
 	LabelReason = "reason"
 )
 
+// Act counter labels. transitd_act_ops{op,result} is the audit trail for router
+// mutations (docs/design.md step 6). The label set is deliberately closed over
+// fixed vocabularies and names no batch, neighbor or prefix: a neighbor address
+// as a label value would make the series cardinality grow with the BGP
+// neighbour table, and an operator queries "how many mutations, of which kind,
+// with which outcome" — never "how many times did 192.0.2.3 flap".
+const (
+	// LabelOp is the mutation kind: "apply" or "rollback".
+	LabelOp = "op"
+	// LabelResult is the outcome: "applied" (commands were issued), "skipped"
+	// (idempotent no-op) or "error" (the batch was refused or vtysh failed).
+	LabelResult = "result"
+)
+
 // Registry is the collector registry transitd exports. It is separate from
 // prometheus.DefaultRegisterer so tests can construct an isolated registry and
 // so the agent can add Go/process collectors explicitly rather than inheriting
@@ -78,6 +92,41 @@ var (
 		Name:      "decisions_total",
 		Help:      "Decisions that would change the rank-1 transit, by from/to/reason. Observe-only: not applied.",
 	}, []string{LabelFrom, LabelTo, LabelReason})
+
+	// ActOps counts vtysh mutation batches by kind and outcome. It is the
+	// durable audit record for a router change: an operator answering "what did
+	// transitd touch, and did it work" reads this counter plus the structured
+	// log line, never a state file. In an observe-only build the only series
+	// present is the zero-value ones a caller explicitly wrote; act is not wired
+	// to decide (issue #4 wiring), so nothing increments it automatically.
+	//
+	// The name lacks the Prometheus counter `_total` suffix; it is fixed by
+	// issue #4's operator contract and the dashboards key on it, so the
+	// deviation is deliberate and documented rather than accidental (the same
+	// way ProbeLatencyMs carries the `_ms` deviation from issue #1).
+	ActOps = prometheus.NewCounterVec(prometheus.CounterOpts{ //nolint:promlinter // name fixed by issue #4's metric contract
+		Namespace: namespace,
+		Name:      "act_ops",
+		Help:      "vtysh mutation batches issued, by op (apply/rollback) and result (applied/skipped/error).",
+	}, []string{LabelOp, LabelResult})
+)
+
+// Act op and result values. They are the label vocabularies for ActOps and are
+// exported so the act package and an operator query read the same strings.
+const (
+	// ActOpApply is a batch that mutates the running configuration.
+	ActOpApply = "apply"
+	// ActOpRollback is a batch that undoes a previous apply.
+	ActOpRollback = "rollback"
+
+	// ActResultApplied is a batch whose commands were issued to vtysh.
+	ActResultApplied = "applied"
+	// ActResultSkipped is an idempotent no-op: the change was already absent, so
+	// no command was issued at all.
+	ActResultSkipped = "skipped"
+	// ActResultError is a batch that was refused before exec, or whose vtysh run
+	// failed.
+	ActResultError = "error"
 )
 
 var registerOnce sync.Once
@@ -88,7 +137,7 @@ var registerOnce sync.Once
 func Register() error {
 	var err error
 	registerOnce.Do(func() {
-		for _, c := range []prometheus.Collector{PinVerified, ProbeLatencyMs, ProbeLossPct, DecisionsTotal} {
+		for _, c := range []prometheus.Collector{PinVerified, ProbeLatencyMs, ProbeLossPct, DecisionsTotal, ActOps} {
 			rerr := Registry.Register(c)
 			if rerr == nil {
 				continue

@@ -32,3 +32,29 @@ diff is the behavior change, in reviewable form.
 Rule of thumb: one ranking-behavior change per release window. Sequencing two
 decide-surface changes together makes any golden diff ambiguous, so land them
 separately.
+
+## Golden vtysh batches
+
+`internal/act/testdata/*.golden` is the regression baseline for the runtime
+mutation batches act issues. Each file is one side of one batch — the ordered
+command list WITHOUT the `configure terminal` / `end` framing, which the
+executor's runner owns.
+
+`TestGoldenBatches` builds each named batch, validates it, and compares both
+sides byte-for-byte against the committed files. The set covers the batches
+issue #4 names: neighbor shutdown (apply `neighbor <ip> shutdown`, rollback
+`no neighbor <ip> shutdown`) and the tcp-mss clamp (apply `neighbor <ip>
+tcp-mss <value>`, rollback `no neighbor <ip> tcp-mss <value>`).
+
+Two invariants are enforced around these goldens, not by the golden files
+themselves:
+
+- **Paired.** Every `Batch` carries a `Rollback` that is the textual inverse of
+  its `Apply`; `Batch.Validate` refuses a batch with an empty side.
+- **Runtime-only.** `Batch.Validate` refuses any command whose verb is a
+  config-persisting one (`write file` and its neighbours) before anything is
+  exec'd, so a golden can never encode a mutation that survives a config
+  re-apply.
+
+A golden diff is a behavior change and belongs in the PR body, the same way a
+decide golden diff does.

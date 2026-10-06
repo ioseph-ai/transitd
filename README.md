@@ -25,9 +25,11 @@ turning your routers into a Kubernetes cluster:
 
 ## Features (roadmap)
 
-- [ ] P1: observation — per-transit probes (latency/loss), BGP/BFD state
-      via `show ... json`, gossip between agents (memberlist), Prometheus
-      metrics, manual `transitctl set-primary <name>`.
+- [x] P1 (partial): observation — per-transit probes (latency/loss) with
+      startup pin verification, Prometheus metrics, healthz endpoint, and the
+      observe-only agent loop (`cmd/transitd`). Remaining P1 core:
+      BGP/BFD state via `show ... json`, gossip between agents (memberlist),
+      manual `transitctl set-primary <name>` (issues #2, #3, #4).
 - [ ] P2: automatic latency/loss-aware transit preference with
       hysteresis + minimum dwell.
 - [ ] P3: traffic engineering — per-prefix-class preferences, scheduled

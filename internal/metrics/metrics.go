@@ -31,6 +31,36 @@ const (
 	LabelReason = "reason"
 )
 
+// Act counter labels. transitd_act_ops{op,result} is the audit trail for router
+// mutations (docs/design.md step 6). The label set is deliberately closed over
+// fixed vocabularies and names no batch, neighbor or prefix: a neighbor address
+// as a label value would make the series cardinality grow with the BGP
+// neighbour table, and an operator queries "how many mutations, of which kind,
+// with which outcome" — never "how many times did 192.0.2.3 flap".
+const (
+	// LabelOp is the mutation kind: "apply" or "rollback".
+	LabelOp = "op"
+	// LabelResult is the outcome: "applied" (commands were issued), "skipped"
+	// (idempotent no-op) or "error" (the batch was refused or vtysh failed).
+	LabelResult = "result"
+)
+
+// LabelFeature is the label on the feature-state gauge: the capability's name
+// as registered in internal/health (issue #5). It is deliberately not a fixed
+// enum here — the registry is generic and a new subsystem adds a feature
+// without this package changing.
+const LabelFeature = "feature"
+
+// Feature-state gauge values, per issue #5's contract.
+const (
+	// FeatureStateEnabled is 0: the capability is working.
+	FeatureStateEnabled = 0
+	// FeatureStateDegraded is 1: the capability is impaired but still running.
+	FeatureStateDegraded = 1
+	// FeatureStateDisabled is 2: the capability has turned itself off.
+	FeatureStateDisabled = 2
+)
+
 // LabelSchemaVersion labels the schema-version receive counter. Its value is the
 // schema_version of the gossiped envelope, as a decimal string. It is a label
 // rather than a per-version metric family because the point an operator reads is
@@ -86,6 +116,35 @@ var (
 		Name:      "decisions_total",
 		Help:      "Decisions that would change the rank-1 transit, by from/to/reason. Observe-only: not applied.",
 	}, []string{LabelFrom, LabelTo, LabelReason})
+
+	// ActOps counts vtysh mutation batches by kind and outcome. It is the
+	// durable audit record for a router change: an operator answering "what did
+	// transitd touch, and did it work" reads this counter plus the structured
+	// log line, never a state file. In an observe-only build the only series
+	// present is the zero-value ones a caller explicitly wrote; act is not wired
+	// to decide (issue #4 wiring), so nothing increments it automatically.
+	//
+	// The name lacks the Prometheus counter `_total` suffix; it is fixed by
+	// issue #4's operator contract and the dashboards key on it, so the
+	// deviation is deliberate and documented rather than accidental (the same
+	// way ProbeLatencyMs carries the `_ms` deviation from issue #1).
+	ActOps = prometheus.NewCounterVec(prometheus.CounterOpts{ //nolint:promlinter // name fixed by issue #4's metric contract
+		Namespace: namespace,
+		Name:      "act_ops",
+		Help:      "vtysh mutation batches issued, by op (apply/rollback) and result (applied/skipped/error).",
+	}, []string{LabelOp, LabelResult})
+
+	// FeatureState is the current state of every registered feature (issue #5),
+	// keyed by feature name: 0 enabled, 1 degraded, 2 disabled. It is a gauge,
+	// not a counter, because the question an operator asks is "what is broken
+	// right now", and because a feature can return to enabled. The registry in
+	// internal/health is the writer; this is the operator-side surface of the
+	// same fact the healthz payload reports.
+	FeatureState = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: namespace,
+		Name:      "feature_state",
+		Help:      "State of a feature capability: 0=enabled, 1=degraded, 2=disabled. Reason is on the healthz payload and the log line.",
+	}, []string{LabelFeature})
 
 	// GossipMembers is the number of alive nodes in the gossip mesh, including
 	// this router. A value of 1 is a healthy single-agent mesh, not an error;
@@ -158,6 +217,24 @@ var (
 	}, []string{LabelTransit})
 )
 
+// Act op and result values. They are the label vocabularies for ActOps and are
+// exported so the act package and an operator query read the same strings.
+const (
+	// ActOpApply is a batch that mutates the running configuration.
+	ActOpApply = "apply"
+	// ActOpRollback is a batch that undoes a previous apply.
+	ActOpRollback = "rollback"
+
+	// ActResultApplied is a batch whose commands were issued to vtysh.
+	ActResultApplied = "applied"
+	// ActResultSkipped is an idempotent no-op: the change was already absent, so
+	// no command was issued at all.
+	ActResultSkipped = "skipped"
+	// ActResultError is a batch that was refused before exec, or whose vtysh run
+	// failed.
+	ActResultError = "error"
+)
+
 var registerOnce sync.Once
 
 // Register installs every metric into Registry. It is idempotent, so it is
@@ -167,7 +244,7 @@ func Register() error {
 	var err error
 	registerOnce.Do(func() {
 		for _, c := range []prometheus.Collector{
-			PinVerified, ProbeLatencyMs, ProbeLossPct, DecisionsTotal,
+			PinVerified, ProbeLatencyMs, ProbeLossPct, DecisionsTotal, ActOps, FeatureState,
 			GossipMembers, GossipRx, GossipTx, GossipSchemaRx,
 			CtrlAuthFail, CtrlRateLimited, CtrlSetPrimary,
 		} {
@@ -215,4 +292,13 @@ func SetProbeLossOnly(transit string, lossPct float64) {
 func ClearProbe(transit string) {
 	ProbeLatencyMs.DeleteLabelValues(transit)
 	ProbeLossPct.DeleteLabelValues(transit)
+}
+
+// SetFeatureState exports one feature capability's current state as
+// transitd_feature_state{feature}. state is the numeric contract from issue #5
+// (FeatureStateEnabled/Degraded/Disabled). The registry in internal/health is
+// the only caller: keeping the write behind one setter means the gauge can
+// never disagree with the healthz payload about what a feature is doing.
+func SetFeatureState(feature string, state int) {
+	FeatureState.WithLabelValues(feature).Set(float64(state))
 }

@@ -1,3 +1,5 @@
 /transitd
+/transitctl
+/bin/
 coverage.out
 dist/

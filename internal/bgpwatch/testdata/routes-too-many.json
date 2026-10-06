@@ -1,0 +1,18 @@
+{
+  "vrfId": 0,
+  "vrfName": "default",
+  "tableVersion": 5,
+  "routerId": "192.0.2.2",
+  "defaultLocPrf": 100,
+  "localAS": 64496,
+  "routes": {
+    "198.51.100.0/24": [{ "valid": true, "bestpath": true, "peerId": "192.0.2.11", "path": "64511 64498", "nexthops": [{ "ip": "192.0.2.11" }] }],
+    "198.51.101.0/24": [{ "valid": true, "bestpath": true, "peerId": "192.0.2.11", "path": "64511 64498", "nexthops": [{ "ip": "192.0.2.11" }] }],
+    "198.51.102.0/24": [{ "valid": true, "bestpath": true, "peerId": "192.0.2.11", "path": "64511 64498", "nexthops": [{ "ip": "192.0.2.11" }] }],
+    "198.51.103.0/24": [{ "valid": true, "bestpath": true, "peerId": "192.0.2.11", "path": "64511 64498", "nexthops": [{ "ip": "192.0.2.11" }] }],
+    "203.0.113.1/32": [{ "valid": true, "bestpath": true, "peerId": "(unspec)", "path": "", "nexthops": [{ "ip": "0.0.0.0" }] }]
+  },
+  "totalRoutes": 5,
+  "totalPaths": 5,
+  "numRoutes": 5
+}

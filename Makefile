@@ -26,6 +26,14 @@ all: build
 build:
 	$(GO) build $(PKG)
 
+# build-binaries builds the two shipped commands into ./bin. `build` alone only
+# compiles packages; an operator (or a smoke test) wants the actual executables,
+# which is what this target produces: the agent and transitctl, the control
+# channel's client.
+build-binaries:
+	$(GO) build -o bin/transitd ./cmd/transitd
+	$(GO) build -o bin/transitctl ./cmd/transitctl
+
 # test is the CI parity target: race detector, no result caching.
 test:
 	$(GO) test -race -count=1 $(PKG)

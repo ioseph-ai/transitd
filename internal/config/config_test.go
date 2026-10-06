@@ -234,3 +234,65 @@ func TestGossipEmptyJoinEntryRejected(t *testing.T) {
 		t.Fatal("expected an error for an empty gossip.join entry")
 	}
 }
+
+// TestControlSocketPathDefault checks the default path and that an explicit one is
+// honoured.
+func TestControlSocketPathDefault(t *testing.T) {
+	c := &Control{}
+	if got := c.SocketPathOrDefault(); got != DefaultControlSocket {
+		t.Errorf("default socket path = %q, want %q", got, DefaultControlSocket)
+	}
+	c.SocketPath = "  /run/transitd/other.sock  "
+	if got := c.SocketPathOrDefault(); got != "/run/transitd/other.sock" {
+		t.Errorf("explicit socket path = %q, want the trimmed value", got)
+	}
+}
+
+// TestControlSocketValidation pins the structural checks: a relative path and an
+// over-long one are both refused at startup rather than discovered as a bind
+// failure.
+func TestControlSocketValidation(t *testing.T) {
+	cases := []struct {
+		name string
+		path string
+		want string
+	}{
+		{"relative path", "run/ctrl.sock", "not an absolute path"},
+		{"over the unix limit", "/" + strings.Repeat("a", 120), "unix socket path must fit"},
+		{"the root directory", "/", "is a directory"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := base()
+			c.Gossip.Key = gossipKey // a key, so the half-configured check does not mask the path check
+			c.Control.SocketPath = tc.path
+			err := c.Validate()
+			if err == nil {
+				t.Fatalf("expected an error for socket_path %q", tc.path)
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("error %q does not contain %q", err, tc.want)
+			}
+		})
+	}
+}
+
+// TestControlSocketWithoutKeyRejected is the half-configured-control-plane guard,
+// mirroring gossip.join-without-key: the channel authenticates with the mesh key,
+// so a socket_path with no key is refused rather than served unauthenticated.
+func TestControlSocketWithoutKeyRejected(t *testing.T) {
+	c := base()
+	c.Control.SocketPath = "/run/transitd/ctrl.sock"
+	err := c.Validate()
+	if err == nil {
+		t.Fatal("expected an error for control.socket_path with no gossip.key")
+	}
+	if !strings.Contains(err.Error(), "gossip.key") {
+		t.Errorf("error %q does not name gossip.key", err)
+	}
+	// With a key the same config is fine.
+	c.Gossip.Key = gossipKey
+	if err := c.Validate(); err != nil {
+		t.Errorf("Validate with a key: %v", err)
+	}
+}

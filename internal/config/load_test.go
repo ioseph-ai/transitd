@@ -39,6 +39,9 @@ func TestLoadExampleConfig(t *testing.T) {
 	if c.ListenMetrics != ":9414" {
 		t.Errorf("listen_metrics = %q, want :9414", c.ListenMetrics)
 	}
+	if got := c.Control.SocketPathOrDefault(); got != "/run/transitd/ctrl.sock" {
+		t.Errorf("control.socket_path = %q, want /run/transitd/ctrl.sock", got)
+	}
 	if c.Dwell != 5*time.Minute || c.Settle != 60*time.Second {
 		t.Errorf("durations decoded wrongly: dwell=%v settle=%v", c.Dwell, c.Settle)
 	}

@@ -1,0 +1,57 @@
+{
+  "prefix": "198.51.100.0/24",
+  "version": 2,
+  "advertisedTo": {
+    "192.0.2.3": { "hostname": "r2" },
+    "192.0.2.11": {}
+  },
+  "pathCount": 1,
+  "paths": [
+    {
+      "aspath": {
+        "string": "64511 64498",
+        "segments": [
+          {
+            "type": "as-sequence",
+            "list": [64511, 64498]
+          }
+        ],
+        "length": 2
+      },
+      "origin": "IGP",
+      "valid": true,
+      "version": 2,
+      "bestpath": {
+        "bestpathFromAs": 64511,
+        "overall": true,
+        "selectionReason": "First path received"
+      },
+      "lastUpdate": {
+        "epoch": 1791314300,
+        "string": "Tue Oct  6 19:18:20 2026"
+      },
+      "lastUpdateStr": "0:00:00:27",
+      "nexthops": [
+        {
+          "ip": "192.0.2.11",
+          "afi": "ipv4",
+          "metric": 0,
+          "accessible": true,
+          "used": true
+        }
+      ],
+      "peer": {
+        "peerId": "192.0.2.11",
+        "routerId": "192.0.2.11",
+        "type": "external"
+      }
+    }
+  ],
+  "multiPathCount": 1,
+  "flags": {
+    "bestPathExists": true,
+    "fibInstalled": false,
+    "fibWaitForInstall": false,
+    "fibSuppress": false
+  }
+}

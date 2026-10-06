@@ -1,13 +1,14 @@
 // Package agent wires transitd's observation pipeline: a validated config, the
-// startup pin-verification preflight, one probe loop per VERIFIED transit, probe
-// samples into decide.Evaluate, and the metrics/healthz surface.
+// startup pin-verification preflight, one probe loop per VERIFIED transit,
+// bounded vtysh BGP-state polling (bgpwatch) for transits with a configured
+// neighbor, probe samples and BGP session state into decide.Evaluate, and the
+// metrics/healthz surface.
 //
-// It is OBSERVE-ONLY. Nothing in this package writes to vtysh, and nothing
-// reachable from it applies anything to the router: a decision is computed by
-// an existing, unchanged decide.Engine, then logged and counted — never
-// applied. The act package that would apply one is future work (issue #4), and
-// TestAgentIsObserveOnly enforces the "no vtysh" half of that constraint
-// structurally rather than by convention.
+// It is OBSERVE-ONLY. Nothing in this package reaches a router mutation path:
+// bgpwatch issues `show` commands only, and the act package that would apply a
+// decision is deliberately NOT wired here (issue #4 wires bgpwatch, not act — no
+// auto-mutations until a later review card). The observe-only constraint is
+// enforced structurally by TestAgentIsObserveOnly rather than by convention.
 //
 // The wiring order is the safety order from issue #1: verify every transit's
 // pin first, then start a loop only for the ones that verified. An unverified
@@ -29,6 +30,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
+	"github.com/ioseph-ai/transitd/internal/bgpwatch"
 	"github.com/ioseph-ai/transitd/internal/config"
 	"github.com/ioseph-ai/transitd/internal/decide"
 	"github.com/ioseph-ai/transitd/internal/gossip"
@@ -57,10 +59,14 @@ const (
 	featurePinning = "pinning"
 	// featureDecisions is the observe-only decision loop.
 	featureDecisions = "decisions"
-	// featureGossip is the memberlist mesh (issue #3). It is not part of this
-	// build, so it is reported disabled with a reason rather than omitted: an
-	// operator asking "are my routers gossiping?" gets an answer.
+	// featureGossip is the memberlist mesh (issue #3).
 	featureGossip = "gossip"
+	// featureBgpwatch is the read-only vtysh BGP session poller. It is only
+	// registered when the poller is actually wired (enabled AND a transit
+	// names a neighbor): a capability the deployment does not use must not
+	// appear as broken. Once wired it is degraded until the first session
+	// observation arrives, so "enabled but not answering" stays visible.
+	featureBgpwatch = "bgpwatch"
 )
 
 // Health is the /healthz payload. Status is the overall verdict; Features
@@ -120,6 +126,10 @@ type Options struct {
 	// Runner executes ping for every probe loop. Nil means probes.ExecRunner{}.
 	Runner probes.Runner
 
+	// BGPWatch executes vtysh `show` queries for the BGP session view. Nil means
+	// bgpwatch.ExecRunner{}. It is only used when config.BGPWatch.Enabled is set.
+	BGPWatch bgpwatch.Runner
+
 	// ProbeBinary is the ping program the probe capability is checked against
 	// at startup. Empty means "ping". It exists so a deployment that puts ping
 	// somewhere unusual can be checked for it, and so the unit tier can force
@@ -172,6 +182,20 @@ type Agent struct {
 	sup    *probes.Supervisor
 	engine *decide.Engine
 
+	// bgp polls BGP session state (bgpwatch), and is nil when bgpwatch is not
+	// enabled or no transit names a neighbor. It is the only vtysh seam
+	// reachable from this package, and it issues read-only `show` queries.
+	bgp *bgpwatch.Poller
+	// sessions is the latest BGP session observation per neighbor address. It is
+	// read and written only by the Run goroutine, so it needs no lock; the
+	// poller's goroutine hands observations over through sessionCh.
+	sessions map[string]bgpwatch.Session
+	// sessionCh carries BGP session observations from the bgpwatch poller to the
+	// Run goroutine. Buffered and drop-on-full, exactly like samples: an
+	// observation is latest-wins, so a dropped one is superseded, never lost in a
+	// way that corrupts state.
+	sessionCh chan bgpwatch.Session
+
 	// reg is the feature capability registry (issue #5). It is the single
 	// writer of the healthz feature map and the transitd_feature_state metric;
 	// its status is the healthz top-level status, so the two cannot disagree.
@@ -197,9 +221,11 @@ type Agent struct {
 	obs map[string]probes.Sample
 
 	// probed is true once any verified transit has produced a sample; running
-	// is true once Run has entered its loop. Both are read by HTTP handlers.
+	// is true once Run has entered its loop; bgpUp is true once a BGP session
+	// observation has arrived. All three are read by HTTP handlers.
 	probed  atomic.Bool
 	running atomic.Bool
+	bgpUp   atomic.Bool
 
 	// mesh is the gossip health mesh, nil when gossip is not configured (or an
 	// override was not supplied).
@@ -235,6 +261,8 @@ func New(opts Options) (*Agent, error) {
 		engine:      decide.NewEngine(opts.Config, &decide.State{WinStreak: map[string]int{}}),
 		samples:     make(chan probes.Sample, 64),
 		obs:         make(map[string]probes.Sample, len(opts.Config.Transits)),
+		sessions:    make(map[string]bgpwatch.Session),
+		sessionCh:   make(chan bgpwatch.Session, 64),
 		probeBinary: opts.ProbeBinary,
 		lookPath:    opts.LookPath,
 		mesh:        opts.Mesh,
@@ -266,6 +294,20 @@ func New(opts Options) (*Agent, error) {
 		Verify: verifier.Verify,
 		Emit:   a.onSample,
 	}
+	// bgpwatch is wired only when enabled AND at least one transit names a
+	// neighbor: a poller with nothing to attribute its sessions to would exec
+	// vtysh every cadence for no observation. It is read-only, so the only
+	// reason to not start it is cost.
+	if opts.Config.BGPWatch.Enabled && anyBGPNeighbor(opts.Config.Transits) {
+		poller := bgpwatch.New(opts.Config.BGPWatch, opts.BGPWatch)
+		poller.Emit = a.onSession
+		a.bgp = poller
+		// Register the capability as soon as the poller exists, in the same
+		// spirit as the gossip pre-registration: a wired poller that never
+		// produces an observation is a degraded capability, not an absent one,
+		// and the gap must be visible before Start runs.
+		a.reg.Register(featureBgpwatch, health.Degraded, "bgpwatch poller wired but no session observation yet")
+	}
 
 	// Capability preflight at construction time, so a build that cannot probe
 	// says so before it ever claims to be observing. The decision loop is
@@ -288,6 +330,17 @@ func New(opts Options) (*Agent, error) {
 		a.reg.Register(featureGossip, health.Degraded, "gossip mesh configured but not started yet")
 	}
 	return a, nil
+}
+
+// anyBGPNeighbor reports whether any transit names a BGP neighbor, i.e. whether a
+// bgpwatch poll can produce an observation the decision engine will consume.
+func anyBGPNeighbor(transits []config.Transit) bool {
+	for _, t := range transits {
+		if t.BGPNeighbor != "" {
+			return true
+		}
+	}
+	return false
 }
 
 // checkProbeCapability probes whether the ICMP probe can work at all in this
@@ -375,6 +428,16 @@ func (a *Agent) Start(ctx context.Context) error {
 		unverified++
 		a.log.Error("pin NOT verified — transit suppressed: no probe samples, no decisions",
 			"transit", t.Name, "expected_egress", t.EgressInterface, "observed_egress", r.EgressIf, "reason", r.Reason)
+	}
+	// bgpwatch starts after the preflight: it is independent of pinning (a
+	// session view is read-only and needs no pin), but starting it here keeps all
+	// vtysh access in one place and one order.
+	if a.bgp != nil {
+		a.log.Info("bgpwatch started (read-only vtysh `show` polling; 1 Hz cap)",
+			"interval", a.bgp.Interval, "max_prefixes", a.bgp.MaxPrefixes)
+		go a.bgp.Run(ctx, a.cfg.Transits, func(err error) {
+			a.log.Warn("bgpwatch poll failed", "err", err.Error())
+		})
 	}
 	// The capability surface follows the preflight: unverified transits degrade
 	// pinning and probes, all-verified keeps both enabled.
@@ -493,6 +556,8 @@ func (a *Agent) Run(ctx context.Context) error {
 			return nil
 		case s := <-a.samples:
 			a.observe(s)
+		case s := <-a.sessionCh:
+			a.observeSession(s)
 		case <-t.C:
 			a.evaluate()
 			// Publish after evaluating, so the view on the wire matches the
@@ -506,6 +571,24 @@ func (a *Agent) Run(ctx context.Context) error {
 func (a *Agent) observe(s probes.Sample) {
 	a.obs[s.Transit] = s
 	a.probed.Store(true)
+}
+
+// observeSession records the latest BGP session observation for a neighbor. It
+// runs on the Run goroutine, like observe.
+func (a *Agent) observeSession(s bgpwatch.Session) {
+	a.sessions[s.Neighbor] = s
+	a.bgpUp.Store(true)
+}
+
+// onSession hands a BGP session observation to the Run goroutine. It is the
+// bgpwatch poller's emit callback, so it must never block: the map is
+// latest-wins and the poller records nothing else here.
+func (a *Agent) onSession(s bgpwatch.Session) {
+	a.bgpUp.Store(true)
+	select {
+	case a.sessionCh <- s:
+	default:
+	}
 }
 
 // onSample hands a probe sample to the Run goroutine. It is called from the
@@ -562,6 +645,14 @@ func labelFrom(primary string) string {
 // means missing, never guessed. Its existence is reported through
 // pin_verified=0 and a degraded healthz instead.
 //
+// SessionUp comes from bgpwatch when the transit names a BGP neighbor AND a
+// session observation for it has arrived; otherwise the transit keeps the
+// probe-only view and reads as up. The distinction matters: "no BGP observation"
+// is not "session down", and reporting a hard-down session the agent has not
+// observed would be a fabricated input to decide. A transit whose probes are not
+// getting through is already excluded by decide's loss threshold, so the
+// probe-only path still carries a liveness signal.
+//
 // A transit whose probes have never produced a reply has no latency
 // measurement. That is passed as +Inf, not 0, so it can never be ranked as the
 // fastest path: "no data" and "instant" must not be the same value.
@@ -569,14 +660,8 @@ func (a *Agent) healthView() []decide.TransitHealth {
 	out := make([]decide.TransitHealth, 0, len(a.obs))
 	for name, s := range a.obs {
 		h := decide.TransitHealth{
-			Name: name,
-			// SessionUp is a BGP fact (bgpwatch, not yet implemented), not a
-			// probe fact, and the agent has no session source to consult.
-			// Reporting a hard-down session it has not observed would be a
-			// fabricated input to decide; instead the probe path carries the
-			// liveness signal, and a transit whose probes are not getting
-			// through is already excluded by decide's loss threshold.
-			SessionUp: true,
+			Name:      name,
+			SessionUp: a.sessionUp(name),
 			LossPct:   s.LossPct,
 			EwmaMs:    s.LatencyMs,
 		}
@@ -591,6 +676,33 @@ func (a *Agent) healthView() []decide.TransitHealth {
 	return out
 }
 
+// sessionUp reports whether a named transit's BGP session is up, per bgpwatch. It
+// returns true when the transit names no neighbor or no observation has arrived
+// yet: an unobserved session is not a down session, and the probe path carries the
+// liveness signal until bgpwatch has something to say. A configured neighbor with
+// an observation that says down returns false.
+func (a *Agent) sessionUp(transit string) bool {
+	neighbor := a.neighborFor(transit)
+	if neighbor == "" {
+		return true
+	}
+	s, ok := a.sessions[neighbor]
+	if !ok {
+		return true
+	}
+	return s.Up
+}
+
+// neighborFor returns the configured BGP neighbor for a transit, or "".
+func (a *Agent) neighborFor(transit string) string {
+	for i := range a.cfg.Transits {
+		if a.cfg.Transits[i].Name == transit {
+			return a.cfg.Transits[i].BGPNeighbor
+		}
+	}
+	return ""
+}
+
 // Health reports the current capability/health state. It is safe to call before
 // Start: the registry holds whatever capabilities have self-reported so far and
 // the status is derived from them, so a half-started agent reports only the
@@ -599,10 +711,12 @@ func (a *Agent) healthView() []decide.TransitHealth {
 // The status is the registry's, not recomputed here, which is what makes the
 // healthz status and the transitd_feature_state metric two views of one fact.
 func (a *Agent) Health() Health {
-	// The gossip feature is refreshed on read so a mesh that joins or fails
-	// after Start is reflected without waiting for another Start: there is no
-	// periodic tick that owns this update, and healthz is the natural one.
+	// The gossip and bgpwatch features are refreshed on read so a mesh that
+	// joins or a poller that starts answering after Start is reflected without
+	// waiting for another Start: there is no periodic tick that owns these
+	// updates, and healthz is the natural one.
 	a.refreshGossipFeature()
+	a.refreshBgpwatchFeature()
 	res := a.sup.Results()
 	pin := make(map[string]bool, len(a.cfg.Transits))
 	for _, t := range a.cfg.Transits {
@@ -652,6 +766,24 @@ func (a *Agent) refreshGossipFeature() {
 		a.reg.Set(featureGossip, health.Degraded, "gossip join not established: "+st.JoinErr)
 	default:
 		a.reg.Set(featureGossip, health.Degraded, "gossip join still in progress; no peer reached yet")
+	}
+}
+
+// refreshBgpwatchFeature folds the bgpwatch poller's state into the feature
+// registry, on the same read-refresh pattern as the gossip feature. A wired
+// poller is degraded until its first session observation arrives: the poller
+// runs on its own goroutine and a vtysh that never answers is exactly the
+// silent failure the registry exists to surface. Once an observation has
+// arrived the feature is enabled — a poll that later fails outright degrades
+// it again through the poller's error path.
+func (a *Agent) refreshBgpwatchFeature() {
+	if a.bgp == nil {
+		return
+	}
+	if a.bgpUp.Load() {
+		a.reg.Set(featureBgpwatch, health.Enabled, "")
+	} else {
+		a.reg.Set(featureBgpwatch, health.Degraded, "bgpwatch poller wired but no session observation yet")
 	}
 }
 

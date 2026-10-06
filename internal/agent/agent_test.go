@@ -762,13 +762,25 @@ func TestAgentStartsMeshAndPublishesSnapshot(t *testing.T) {
 // the clearest way to say it — and a guard that forbade the word would push the
 // explanation out of the code and let a real call hide behind the same word. What
 // is forbidden is a mutation in executable code.
+//
+// bgpwatch changed the shape of this guard: the agent now legitimately imports a
+// package that execs vtysh, so a bare ban on the literal "vtysh" would forbid a
+// read-only capability the card asks for. The read-only half is enforced where it
+// can be precise — bgpwatch's own TestSourceIssuesNoMutatingCommand asserts that
+// package issues only `show` — and what is forbidden HERE is the thing the agent
+// must not reach: the act mutation package, and the mutation verbs act would
+// issue.
 func TestAgentIsObserveOnly(t *testing.T) {
 	// Assembled at run time so the guard's own source cannot trip it.
 	banned := []string{
-		"vty" + "sh",            // the FRR config CLI: any use is an act path
-		"exec." + "Command",     // a second exec seam besides the probe/pin runners
-		"clear " + "bgp",        // the soft-clear the act package will issue
-		"local-" + "preference", // the LP write act will perform
+		"internal/" + "act",      // the mutation package: importing it is wiring act in
+		"act." + "Executor",      // constructing an executor
+		"act." + "Batch",         // building a mutation
+		"exec." + "Command",      // a direct exec seam besides the injected runners
+		"clear " + "bgp",         // the soft-clear act will issue
+		"local-" + "preference",  // the LP write act will perform
+		"write " + "file",        // the persistence verb act must never reach
+		"neighbor " + "shutdown", // the drill's mutation, owned by act
 	}
 	entries, err := os.ReadDir(".")
 	if err != nil {

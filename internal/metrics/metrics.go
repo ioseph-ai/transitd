@@ -22,6 +22,15 @@ const namespace = "transitd"
 // the series identity changing.
 const LabelTransit = "transit"
 
+// Decision counter labels. They mirror docs/design.md's audit contract
+// (transitd_decisions_total{from,to,reason}): the audit trail an operator reads
+// to answer "why did preference move, and when".
+const (
+	LabelFrom   = "from"
+	LabelTo     = "to"
+	LabelReason = "reason"
+)
+
 // Registry is the collector registry transitd exports. It is separate from
 // prometheus.DefaultRegisterer so tests can construct an isolated registry and
 // so the agent can add Go/process collectors explicitly rather than inheriting
@@ -57,6 +66,18 @@ var (
 		Name:      "probe_loss_pct",
 		Help:      "ICMP probe packet loss over the rolling window, percent, per transit.",
 	}, []string{LabelTransit})
+
+	// DecisionsTotal counts decisions that WOULD change the rank-1 transit,
+	// labeled by the from/to/reason audit triple from docs/design.md. It is a
+	// counter, not a gauge, because the question it answers is "how often and
+	// why", which a gauge cannot. In observe-only builds nothing acts on these
+	// decisions (issue #4); the counter is the durable record that the agent
+	// reached a verdict, whether or not a future act package can apply it.
+	DecisionsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: namespace,
+		Name:      "decisions_total",
+		Help:      "Decisions that would change the rank-1 transit, by from/to/reason. Observe-only: not applied.",
+	}, []string{LabelFrom, LabelTo, LabelReason})
 )
 
 var registerOnce sync.Once
@@ -67,7 +88,7 @@ var registerOnce sync.Once
 func Register() error {
 	var err error
 	registerOnce.Do(func() {
-		for _, c := range []prometheus.Collector{PinVerified, ProbeLatencyMs, ProbeLossPct} {
+		for _, c := range []prometheus.Collector{PinVerified, ProbeLatencyMs, ProbeLossPct, DecisionsTotal} {
 			rerr := Registry.Register(c)
 			if rerr == nil {
 				continue

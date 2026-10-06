@@ -116,13 +116,45 @@ func TestProbeGaugesAndSuppression(t *testing.T) {
 	}
 }
 
+// TestDecisionsCounterAuditTriple pins the decision counter's label contract from
+// docs/design.md: transitd_decisions_total carries the from/to/reason triple, so
+// the audit trail can answer "why did preference move". The from label renders a
+// first adoption as "-" rather than an empty string, which would be awkward to
+// query and easy to confuse with a missing label.
+func TestDecisionsCounterAuditTriple(t *testing.T) {
+	if err := Register(); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	DecisionsTotal.WithLabelValues("-", "main", "initial adoption").Inc()
+	DecisionsTotal.WithLabelValues("main", "backup", "challenger won margin for required cycles").Inc()
+
+	fams := gather(t)
+	fam := fams["transitd_decisions_total"]
+	if fam == nil {
+		t.Fatal("transitd_decisions_total not exported")
+	}
+	var sawAdoption bool
+	for _, m := range fam.GetMetric() {
+		labels := map[string]string{}
+		for _, lp := range m.GetLabel() {
+			labels[lp.GetName()] = lp.GetValue()
+		}
+		if labels[LabelFrom] == "-" && labels[LabelTo] == "main" && labels[LabelReason] == "initial adoption" {
+			sawAdoption = m.GetCounter().GetValue() > 0
+		}
+	}
+	if !sawAdoption {
+		t.Error("decisions_total does not carry the from/to/reason audit triple")
+	}
+}
+
 // TestMetricNamesAreNamespaced is a cheap regression guard on the operator-facing
 // contract: every metric this package registers is under the transitd_ prefix.
 func TestMetricNamesAreNamespaced(t *testing.T) {
 	if err := Register(); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
-	for _, c := range []prometheus.Collector{PinVerified, ProbeLatencyMs, ProbeLossPct} {
+	for _, c := range []prometheus.Collector{PinVerified, ProbeLatencyMs, ProbeLossPct, DecisionsTotal} {
 		desc := make(chan *prometheus.Desc, 1)
 		c.Describe(desc)
 		close(desc)

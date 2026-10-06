@@ -91,6 +91,17 @@ type Mesh struct {
 	del  *delegate
 	done chan struct{}
 
+	// stop is closed by Shutdown to tell the broadcast loop to exit; loopExited
+	// is closed by the loop when it has. Shutdown waits on the latter before
+	// tearing memberlist down, so no tick can be in flight against a closed mesh
+	// (which would count a GossipTx for a message never sent and republish the
+	// member gauge as non-zero after shutdown set it to 0).
+	stop       chan struct{}
+	loopExited chan struct{}
+	// stopped is the fast check broadcastOnce consults, so a tick already
+	// dequeued by select does not do work after the stop signal.
+	stopped atomic.Bool
+
 	joined  atomic.Bool
 	joinErr atomic.Pointer[string]
 
@@ -112,7 +123,12 @@ func New(opts Options) (*Mesh, error) {
 	if _, err := opts.Config.Gossip.KeyBytes(); err != nil {
 		return nil, fmt.Errorf("gossip: %w", err)
 	}
-	m := &Mesh{opts: opts, log: opts.Log, done: make(chan struct{})}
+	m := &Mesh{
+		opts: opts,
+		log:  opts.Log,
+		done: make(chan struct{}),
+		stop: make(chan struct{}),
+	}
 	if m.log == nil {
 		m.log = slog.Default()
 	}
@@ -211,6 +227,7 @@ func (m *Mesh) Start(ctx context.Context) error {
 	// Delegate set, memberlist has nowhere to deliver user messages and never
 	// consults GetBroadcasts.
 	mlConf.Delegate = m.del
+	m.loopExited = make(chan struct{})
 
 	ml, err := memberlist.Create(mlConf)
 	if err != nil {
@@ -230,6 +247,15 @@ func (m *Mesh) Start(ctx context.Context) error {
 	}
 
 	go m.broadcastLoop(ctx)
+	// A separate watcher (not the loop) owns the ctx-driven shutdown, so the loop
+	// can exit and announce it without Shutdown waiting on the caller itself.
+	go func() {
+		select {
+		case <-ctx.Done():
+			m.Shutdown()
+		case <-m.done:
+		}
+	}()
 	return nil
 }
 
@@ -284,7 +310,12 @@ func (m *Mesh) joinAsync(peers []string) {
 // broadcastLoop puts a fresh snapshot on the mesh every interval and refreshes
 // the member gauge. The snapshot is built here, on this goroutine, so a slow
 // builder cannot stall memberlist's receive path.
+//
+// It announces its exit on loopExited so Shutdown can wait for it: without that
+// wait, a tick already selected could run after Shutdown and count a GossipTx for
+// a message on a closed mesh, or republish the member gauge as non-zero.
 func (m *Mesh) broadcastLoop(ctx context.Context) {
+	defer close(m.loopExited)
 	t := time.NewTicker(m.opts.Interval)
 	defer t.Stop()
 	// Send one immediately: a peer that comes up after this node should not wait a
@@ -293,20 +324,27 @@ func (m *Mesh) broadcastLoop(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
-			m.Shutdown()
+			// Exit only; the watcher goroutine owns the ctx-driven Shutdown. The
+			// loop must not call it here, because Shutdown waits for this loop to
+			// exit and would deadlock against its own caller.
 			return
-		case <-m.done:
-			// Shutdown was called directly (not via ctx). Stop ticking: every
-			// further tick would count a GossipTx for a message on a closed mesh
-			// and overwrite the GossipMembers=0 that Shutdown set.
+		case <-m.stop:
+			// Shutdown was called directly (not via ctx), or by another path. Stop
+			// ticking; Shutdown is waiting on loopExited.
 			return
 		case <-t.C:
+			if m.stopped.Load() {
+				return
+			}
 			m.broadcastOnce()
 		}
 	}
 }
 
 func (m *Mesh) broadcastOnce() {
+	if m.stopped.Load() {
+		return
+	}
 	metrics.GossipMembers.Set(float64(m.members()))
 	msg, err := Encode(m.opts.Config.RouterName, time.Now(), m.opts.Snapshot())
 	if err != nil {
@@ -364,7 +402,22 @@ func (m *Mesh) Local() string {
 func (m *Mesh) Shutdown() {
 	m.closeOnce.Do(func() {
 		close(m.done)
+		// Signal the loop and wait for it, so no broadcast tick can still be in
+		// flight once memberlist is torn down below. The wait is bounded: if Start
+		// was never called the loop never existed, and if the loop is the caller
+		// (it is not — the ctx watcher owns that path) this would deadlock, so the
+		// select on done covers a second Shutdown racing this one.
+		m.stopped.Store(true)
+		close(m.stop)
+		if m.loopExited != nil {
+			select {
+			case <-m.loopExited:
+			case <-time.After(2 * time.Second):
+				m.log.Warn("gossip: broadcast loop did not stop within 2s; continuing shutdown")
+			}
+		}
 		if m.ml == nil {
+			metrics.GossipMembers.Set(0)
 			return
 		}
 		// A clean leave tells peers this node is gone, rather than making them

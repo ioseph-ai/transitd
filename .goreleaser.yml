@@ -15,5 +15,46 @@ archives:
     name_template: "{{ .ProjectName }}_{{ .Os }}_{{ .Arch }}{{ if .Arm }}v{{ .Arm }}{{ end }}"
 checksum:
   name_template: checksums.txt
+# Changelog is generated from git history between the previous and the current
+# tag. `sort: asc` keeps the newest commits last (matching release-notes
+# convention); the filters drop docs-only, dependency-bump, and merge commits,
+# which carry no user-visible change. feat/fix/... subjects still pass through.
 changelog:
-  disable: true
+  use: git
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^chore\\(deps\\)"
+      - "^Merge pull request"
+      - "^Merge branch"
+# Container image for the deployment target (a container on VyOS).
+#
+# dockers_v2 reuses the binaries produced by the `builds` section above: the
+# buildx build context is a temporary dir laid out as <os>/<arch>/transitd, so
+# the Dockerfile only COPYs the platform-matching binary into distroless — no
+# rebuild inside the image. buildx builds the amd64+arm64 manifest list and
+# pushes it in a single step, which is why images are produced in the publish
+# phase (a tag release); `--snapshot` instead builds one local image per
+# platform with the platform appended to the tag, which is what we exercise in
+# CI-less validation.
+dockers_v2:
+  - ids: [transitd]
+    dockerfile: Dockerfile
+    images:
+      - ghcr.io/ioseph-ai/transitd
+    tags:
+      - "{{ .Version }}"
+      - latest
+    platforms:
+      - linux/amd64
+      - linux/arm64
+    annotations:
+      "org.opencontainers.image.source": "{{ .GitURL }}"
+      "org.opencontainers.image.version": "{{ .Version }}"
+      "org.opencontainers.image.revision": "{{ .FullCommit }}"
+      "org.opencontainers.image.licenses": "MIT"
+# digests.txt records the published image digest(s) so the release workflow can
+# attest the image (in addition to checksums.txt for the archives).
+docker_digest:
+  name_template: digests.txt

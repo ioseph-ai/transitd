@@ -1,0 +1,41 @@
+# Example transitd configuration. Every address is from an RFC 5737 / RFC 3849
+# documentation range; no deployment values appear here.
+router_name: r-example
+
+# Gossip mesh endpoint (memberlist). The mesh itself is assumed trusted
+# (wireguard); the key is treated like an SSH key.
+bind_addr: 192.0.2.10
+join:
+  - 192.0.2.11
+key_b64: ""
+
+listen_metrics: ":9414"
+
+# Decision tuning (all optional; the shown values are the defaults).
+margin_ms: 10
+win_cycles: 3
+dwell: 5m
+max_switches_per_hour: 4
+settle: 60s
+loss_drop_pct: 5
+base_lp: 200
+lp_step: 50
+
+transits:
+  - name: main
+    import_map: MAIN-LOCAL-IN
+    # The pin: this transit's own interface address, used as the `from`
+    # selector of the startup route lookup and the `-I` of every ICMP probe.
+    probe_source: 192.0.2.1
+    # Canary destination probed via this transit.
+    probe_target: 198.51.100.5
+    # The egress the probes must actually leave through (assertion target).
+    egress_interface: eth-transit
+    probe_interval: 30s
+
+  - name: backup
+    import_map: BACKUP-LOCAL-IN
+    probe_source: 192.0.2.2
+    probe_target: 198.51.100.6
+    egress_interface: eth-backup
+    probe_interval: 30s

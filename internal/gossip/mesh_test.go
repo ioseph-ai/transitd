@@ -50,6 +50,10 @@ func testConfig(t *testing.T, router string) *config.Config {
 
 // memberlistConfigFor builds a memberlist config that binds an ephemeral port on
 // loopback, so two meshes can run in one test process without colliding on 7946.
+//
+// It deliberately does NOT set Events: the mesh installs its own event delegate on
+// the override path too, and a test that supplied its own would be testing a mesh
+// that production never runs. See TestMemberlistConfigAlwaysInstallsTheEventDelegate.
 func memberlistConfigFor(c *config.Config) *memberlist.Config {
 	ml := memberlist.DefaultLANConfig()
 	ml.Name = c.RouterName

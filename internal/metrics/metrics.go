@@ -31,6 +31,14 @@ const (
 	LabelReason = "reason"
 )
 
+// LabelSchemaVersion labels the schema-version receive counter. Its value is the
+// schema_version of the gossiped envelope, as a decimal string. It is a label
+// rather than a per-version metric family because the point an operator reads is
+// "which versions are still on the wire", and a single series with one label
+// answers it directly — including for versions this build does not know, which
+// is exactly the rollout signal the append-only schema exists to make visible.
+const LabelSchemaVersion = "version"
+
 // Registry is the collector registry transitd exports. It is separate from
 // prometheus.DefaultRegisterer so tests can construct an isolated registry and
 // so the agent can add Go/process collectors explicitly rather than inheriting
@@ -78,6 +86,45 @@ var (
 		Name:      "decisions_total",
 		Help:      "Decisions that would change the rank-1 transit, by from/to/reason. Observe-only: not applied.",
 	}, []string{LabelFrom, LabelTo, LabelReason})
+
+	// GossipMembers is the number of alive nodes in the gossip mesh, including
+	// this router. A value of 1 is a healthy single-agent mesh, not an error;
+	// the mesh growing past 1 is what makes the merged health view useful, and
+	// the number falling back to 1 is the partition signal an operator watches.
+	GossipMembers = prometheus.NewGauge(prometheus.GaugeOpts{
+		Namespace: namespace,
+		Name:      "gossip_members",
+		Help:      "Number of alive nodes in the gossip mesh, including this router.",
+	})
+
+	// GossipRx counts every message that reaches the delegate's receive path,
+	// including frames that fail to decode. It is incremented before Decode so a
+	// peer streaming garbage is visible as rx traffic rather than silently
+	// disappearing; the per-version counter below is what breaks the rate down by
+	// schema, and only increments once the envelope decoded.
+	GossipRx = prometheus.NewCounter(prometheus.CounterOpts{ //nolint:promlinter // name fixed by issue #3's metric contract
+		Namespace: namespace,
+		Name:      "gossip_rx",
+		Help:      "Gossip messages received from the mesh, including frames that failed to decode.",
+	})
+
+	// GossipTx counts gossip health messages this router broadcast onto the mesh.
+	GossipTx = prometheus.NewCounter(prometheus.CounterOpts{ //nolint:promlinter // name fixed by issue #3's metric contract
+		Namespace: namespace,
+		Name:      "gossip_tx",
+		Help:      "Gossip health messages broadcast by this router.",
+	})
+
+	// GossipSchemaRx counts received health messages by the schema_version of
+	// their envelope. A series for a version this build does not know is the
+	// rollout signal the append-only policy is built around: it proves a newer
+	// peer is on the wire and that this node is ignoring, not erroring on, its
+	// unknown fields.
+	GossipSchemaRx = prometheus.NewCounterVec(prometheus.CounterOpts{ //nolint:promlinter // name fixed by issue #3's metric contract
+		Namespace: namespace,
+		Name:      "gossip_schema_rx",
+		Help:      "Gossip health messages received, by envelope schema_version.",
+	}, []string{LabelSchemaVersion})
 )
 
 var registerOnce sync.Once
@@ -88,7 +135,10 @@ var registerOnce sync.Once
 func Register() error {
 	var err error
 	registerOnce.Do(func() {
-		for _, c := range []prometheus.Collector{PinVerified, ProbeLatencyMs, ProbeLossPct, DecisionsTotal} {
+		for _, c := range []prometheus.Collector{
+			PinVerified, ProbeLatencyMs, ProbeLossPct, DecisionsTotal,
+			GossipMembers, GossipRx, GossipTx, GossipSchemaRx,
+		} {
 			rerr := Registry.Register(c)
 			if rerr == nil {
 				continue

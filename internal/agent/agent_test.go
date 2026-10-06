@@ -19,12 +19,47 @@ import (
 
 	dto "github.com/prometheus/client_model/go"
 
+	"github.com/hashicorp/memberlist"
+
 	"github.com/ioseph-ai/transitd/internal/config"
 	"github.com/ioseph-ai/transitd/internal/decide"
+	"github.com/ioseph-ai/transitd/internal/gossip"
 	"github.com/ioseph-ai/transitd/internal/metrics"
 	"github.com/ioseph-ai/transitd/internal/pinning"
 	"github.com/ioseph-ai/transitd/internal/probes"
 )
+
+// newTestMesh builds a mesh over an ephemeral loopback port, so an agent test can
+// exercise the real gossip wiring without binding the default mesh port. The
+// cadence is short so a test does not wait a production interval.
+func newTestMesh(t *testing.T, c *config.Config) *gossip.Mesh {
+	t.Helper()
+	ml := memberlist.DefaultLANConfig()
+	ml.Name = c.RouterName
+	ml.BindAddr = "127.0.0.1"
+	ml.BindPort = 0
+	ml.AdvertisePort = 0
+	key, err := c.Gossip.KeyBytes()
+	if err != nil {
+		t.Fatalf("gossip key: %v", err)
+	}
+	ml.SecretKey = key
+	ml.LogOutput = io.Discard
+	ml.ProbeInterval = 100 * time.Millisecond
+	ml.PushPullInterval = 100 * time.Millisecond
+	ml.GossipInterval = 50 * time.Millisecond
+	m, err := gossip.New(gossip.Options{
+		Config:           c,
+		Snapshot:         func() gossip.HealthPayload { return gossip.HealthPayload{} },
+		Interval:         50 * time.Millisecond,
+		Log:              discardingLog(),
+		MemberlistConfig: ml,
+	})
+	if err != nil {
+		t.Fatalf("gossip.New: %v", err)
+	}
+	return m
+}
 
 // --- fakes -------------------------------------------------------------------
 
@@ -486,6 +521,89 @@ func TestRunReturnsErrorFromStart(t *testing.T) {
 
 	if err := a.Run(context.Background()); err == nil {
 		t.Fatal("Run returned nil, want the Start error")
+	}
+}
+
+// --- health mesh (issue #3) --------------------------------------------------
+
+// TestHealthzOmitsGossipWhenUnconfigured checks the opt-in default surfaces
+// cleanly: a router with no mesh must not report a gossip object at all, so an
+// operator cannot mistake "not configured" for "configured and broken".
+func TestHealthzOmitsGossipWhenUnconfigured(t *testing.T) {
+	c := testConfig(t, "no-mesh")
+	a := newTestAgent(t, c, &fakeVerifier{verified: map[string]bool{"no-mesh": true}}, &scriptedRunner{})
+
+	h := a.Health()
+	if h.Gossip != nil {
+		t.Errorf("Health.Gossip = %+v, want nil for a router with no mesh", h.Gossip)
+	}
+	if h.Features["gossip"] != featureUnavailable {
+		t.Errorf("features[gossip] = %q, want unavailable", h.Features["gossip"])
+	}
+}
+
+// TestAgentStartsMeshAndPublishesSnapshot is the wiring test behind the card's
+// "broadcasts a periodic HealthMsg containing the sender's per-transit probe
+// summary + decide view". It runs the agent's real Start against a real mesh (an
+// ephemeral loopback port) and asserts that the payload the mesh broadcasts is
+// built from the agent's own observations and decision state.
+func TestAgentStartsMeshAndPublishesSnapshot(t *testing.T) {
+	const name = "mesh-pub"
+	c := testConfig(t, name)
+	c.Gossip.Key = "ZXhhbXBsZS1rZXktbm90LWEtc2VjcmV0LTMyYnl0ZXM="
+	if err := c.Validate(); err != nil {
+		t.Fatalf("fixture does not validate with a mesh: %v", err)
+	}
+
+	a, err := New(Options{
+		Config:   c,
+		Verifier: &fakeVerifier{verified: map[string]bool{name: true}},
+		Runner:   &scriptedRunner{reply: true, rttMs: 21.5},
+		Interval: 5 * time.Millisecond,
+		Log:      discardingLog(),
+		Mesh:     newTestMesh(t, c),
+		OnPeer:   func(gossip.Message) {},
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	// Run, not Start: the decision loop's tick is what republishes the snapshot
+	// after samples arrive, so the loop has to be running for the payload to be
+	// current.
+	runErr := make(chan error, 1)
+	go func() { runErr <- a.Run(ctx) }()
+	waitFor(t, time.Second, func() bool { return a.probed.Load() })
+	waitFor(t, 2*time.Second, func() bool { return len(a.currentSnapshot().Transits) == 1 })
+
+	snap := a.currentSnapshot()
+	if snap.Transits[0].Name != name {
+		t.Fatalf("snapshot transit = %q, want %q", snap.Transits[0].Name, name)
+	}
+	if snap.Transits[0].EwmaMs == nil || *snap.Transits[0].EwmaMs != 21.5 {
+		t.Errorf("snapshot ewma = %v, want 21.5", snap.Transits[0].EwmaMs)
+	}
+
+	// The healthz surface must now report the mesh as configured and joined.
+	h := a.Health()
+	if h.Gossip == nil {
+		t.Fatal("Health.Gossip = nil while a mesh is running")
+	}
+	if !h.Gossip.Enabled || !h.Gossip.Joined {
+		t.Errorf("gossip health = %+v, want enabled and joined (single-node mesh)", h.Gossip)
+	}
+	if h.Features["gossip"] != featureOK {
+		t.Errorf("features[gossip] = %q, want ok", h.Features["gossip"])
+	}
+
+	// Cancel first, then wait: Run's ctx-cancel path is what shuts the mesh down,
+	// and leaving a mesh listening past the test would leak a port into the next
+	// test in the package.
+	cancel()
+	if err := <-runErr; err != nil {
+		t.Fatalf("Run: %v", err)
 	}
 }
 

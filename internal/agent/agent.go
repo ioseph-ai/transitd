@@ -30,6 +30,7 @@ import (
 
 	"github.com/ioseph-ai/transitd/internal/config"
 	"github.com/ioseph-ai/transitd/internal/decide"
+	"github.com/ioseph-ai/transitd/internal/gossip"
 	"github.com/ioseph-ai/transitd/internal/metrics"
 	"github.com/ioseph-ai/transitd/internal/pinning"
 	"github.com/ioseph-ai/transitd/internal/probes"
@@ -67,6 +68,27 @@ type Health struct {
 	// Features reports the agent's capability surface: "ok" or "unavailable"
 	// per capability.
 	Features map[string]string `json:"features"`
+	// Gossip reports the health mesh's state (issue #3). It is a pointer so that a
+	// router with no mesh configured omits the field entirely, which is
+	// distinguishable from a mesh that is configured and failing to join.
+	Gossip *GossipHealth `json:"gossip,omitempty"`
+}
+
+// GossipHealth is the mesh's entry in the healthz payload. It mirrors
+// gossip.Status but is a distinct type so this package's JSON contract does not
+// change every time the mesh adds an internal field.
+type GossipHealth struct {
+	// Enabled is whether a mesh is configured. It is always true when this object
+	// is present, and is carried explicitly so a consumer can read one object
+	// without also checking for its absence.
+	Enabled bool `json:"enabled"`
+	// Joined is whether the startup join reached a peer. A mesh with no peers is
+	// joined by definition.
+	Joined bool `json:"joined"`
+	// Members is the alive node count, including this router.
+	Members int `json:"members"`
+	// JoinErr is the startup join failure, empty on success.
+	JoinErr string `json:"join_error,omitempty"`
 }
 
 // Options is the agent's configuration. Every field is optional except Config,
@@ -91,6 +113,17 @@ type Options struct {
 	// Log receives startup, decision and shutdown lines. Nil means
 	// slog.Default().
 	Log *slog.Logger
+
+	// OnPeer, when set, receives each health message this router decodes from the
+	// mesh. It is the seam the merged-health view (and, later, the visibility
+	// monitor) reads from. Nil means the agent records nothing — the mesh still
+	// runs, so peers see this router and the member count is right, but nothing
+	// is merged locally.
+	OnPeer func(gossip.Message)
+
+	// Mesh is an override for the gossip mesh, for tests. Nil means the agent
+	// builds one from Config.Gossip when that is enabled.
+	Mesh *gossip.Mesh
 }
 
 // Agent owns the probe supervisor and the decision engine, and is the driver
@@ -119,6 +152,18 @@ type Agent struct {
 	// is true once Run has entered its loop. Both are read by HTTP handlers.
 	probed  atomic.Bool
 	running atomic.Bool
+
+	// mesh is the gossip health mesh, nil when gossip is not configured (or an
+	// override was not supplied).
+	mesh *gossip.Mesh
+	// onPeer is the caller's peer-message hook, kept so Start can hand it to a
+	// mesh it builds itself.
+	onPeer func(gossip.Message)
+	// snap is the latest payload for the mesh to broadcast. It is written by the
+	// Run goroutine — which owns obs — and read by the mesh's broadcast goroutine,
+	// so it is the one place the two need an atomic hand-off. Storing the whole
+	// immutable payload keeps the mesh from ever reading a half-updated view.
+	snap atomic.Pointer[gossip.HealthPayload]
 }
 
 // New validates cfg and wires the observe-only pipeline. It registers the
@@ -142,6 +187,8 @@ func New(opts Options) (*Agent, error) {
 		engine:   decide.NewEngine(opts.Config, &decide.State{WinStreak: map[string]int{}}),
 		samples:  make(chan probes.Sample, 64),
 		obs:      make(map[string]probes.Sample, len(opts.Config.Transits)),
+		mesh:     opts.Mesh,
+		onPeer:   opts.OnPeer,
 	}
 	if a.log == nil {
 		a.log = slog.Default()
@@ -184,7 +231,85 @@ func (a *Agent) Start(ctx context.Context) error {
 		a.log.Error("pin NOT verified — transit suppressed: no probe samples, no decisions",
 			"transit", t.Name, "expected_egress", t.EgressInterface, "observed_egress", r.EgressIf, "reason", r.Reason)
 	}
+	if err := a.startMesh(ctx); err != nil {
+		return fmt.Errorf("agent: %w", err)
+	}
 	return nil
+}
+
+// startMesh brings up the gossip health mesh, if one is configured or was
+// supplied. A disabled mesh is the normal single-router case and is not an error.
+//
+// A failed JOIN is also not an error: the mesh is up and a peer can still join
+// this node, so the agent keeps measuring its own transits. The failure is carried
+// in gossip.Status, which healthz reports (issue #5).
+//
+// The snapshot closure is what makes the mesh carry THIS router's view without the
+// mesh needing a reference to the agent's internals: it reads the atomically
+// published payload, so a broadcast tick can never observe a half-updated obs map.
+func (a *Agent) startMesh(ctx context.Context) error {
+	if a.mesh == nil {
+		if !a.cfg.Gossip.Enabled() {
+			return nil
+		}
+		m, err := gossip.New(gossip.Options{
+			Config:    a.cfg,
+			Snapshot:  a.currentSnapshot,
+			OnMessage: a.onPeer,
+			Log:       a.log,
+		})
+		if err != nil {
+			return err
+		}
+		a.mesh = m
+	}
+	// Publish an initial (empty) snapshot so a broadcast before the first probe
+	// sample sends "nothing measured yet" rather than a stale value.
+	a.publishSnapshot()
+	if err := a.mesh.Start(ctx); err != nil {
+		return err
+	}
+	st := a.mesh.Status()
+	a.log.Info("gossip mesh started",
+		"router", a.cfg.RouterName, "members", st.Members, "joined", st.Joined, "local", a.mesh.Local())
+	return nil
+}
+
+// currentSnapshot returns the payload the mesh should broadcast. It is the
+// SnapshotFunc the mesh calls, and it is safe to call from the mesh's goroutine:
+// it only reads the atomically published value.
+func (a *Agent) currentSnapshot() gossip.HealthPayload {
+	if p := a.snap.Load(); p != nil {
+		return *p
+	}
+	return gossip.HealthPayload{}
+}
+
+// publishSnapshot folds the current observations and decision state into an
+// immutable payload and publishes it for the mesh. It runs on the Run goroutine,
+// which owns obs, so the read needs no lock — only the publication does.
+func (a *Agent) publishSnapshot() {
+	p := gossip.HealthPayload{Transits: make([]gossip.TransitSummary, 0, len(a.obs))}
+	for name, s := range a.obs {
+		p.Transits = append(p.Transits, gossip.TransitSummary{
+			Name:      name,
+			SessionUp: true, // probe-derived liveness; see healthView's note
+			LossPct:   s.LossPct,
+			// FloatPtr turns "no reply yet" (NaN) into an absent field, so a
+			// peer cannot read a silent transit as a 0 ms path.
+			EwmaMs: gossip.FloatPtr(s.LatencyMs),
+		})
+	}
+	sort.Slice(p.Transits, func(i, j int) bool { return p.Transits[i].Name < p.Transits[j].Name })
+	if primary := a.engine.State.Primary; primary != "" {
+		p.Decide = &gossip.DecideView{
+			Primary:  primary,
+			Switched: true, // this router has adopted a primary; the reason is local
+			Reason:   "local decision state (observe-only)",
+			Frozen:   a.engine.State.Frozen,
+		}
+	}
+	a.snap.Store(&p)
 }
 
 // Run starts the pipeline and blocks until ctx is cancelled, then returns nil.
@@ -205,11 +330,20 @@ func (a *Agent) Run(ctx context.Context) error {
 		select {
 		case <-ctx.Done():
 			a.log.Info("agent loop stopping: probe loops cancelled with it")
+			// Stop the mesh with the loop: it is the loop that publishes the view
+			// it broadcasts, so a mesh outliving the loop would gossip a frozen
+			// snapshot.
+			if a.mesh != nil {
+				a.mesh.Shutdown()
+			}
 			return nil
 		case s := <-a.samples:
 			a.observe(s)
 		case <-t.C:
 			a.evaluate()
+			// Publish after evaluating, so the view on the wire matches the
+			// decision state it was derived from.
+			a.publishSnapshot()
 		}
 	}
 }
@@ -342,7 +476,25 @@ func (a *Agent) Health() Health {
 	} else {
 		features["decisions"] = featureUnavailable
 	}
-	return Health{Status: status, PinVerified: pin, Features: features}
+	// "gossip" is dynamic in the same spirit as "probes": its failure mode — a
+	// configured mesh that never reached a peer — would otherwise be silent.
+	features["gossip"] = featureUnavailable
+
+	var gh *GossipHealth
+	if a.mesh != nil {
+		st := a.mesh.Status()
+		gh = &GossipHealth{Enabled: st.Enabled, Joined: st.Joined, Members: st.Members, JoinErr: st.JoinErr}
+		if st.Enabled && st.Joined {
+			features["gossip"] = featureOK
+		}
+		// A configured mesh that is running but never joined a peer is a degraded
+		// router: it measures and decides locally, but it is not contributing to
+		// or reading the merged view. Saying so is the whole point of healthz.
+		if st.Enabled && !st.Joined {
+			status = statusDegraded
+		}
+	}
+	return Health{Status: status, PinVerified: pin, Features: features, Gossip: gh}
 }
 
 // Handler returns the agent's HTTP surface: /metrics for the Prometheus registry

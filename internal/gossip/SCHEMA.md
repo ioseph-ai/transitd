@@ -125,7 +125,9 @@ the v1 payload and every node on the current version sees it.
 ## Metrics
 
 - `transitd_gossip_members` — alive mesh size, including this router.
-- `transitd_gossip_rx` — health messages accepted by the decode path.
+- `transitd_gossip_rx` — messages reaching the delegate's receive path, counted
+  before decode, so it includes frames that fail to decode. The per-version
+  counter is the one that breaks the rate down by schema.
 - `transitd_gossip_tx` — health messages broadcast by this router.
 - `transitd_gossip_schema_rx{version}` — messages received, by envelope
   `schema_version`. A series for a version this build does not know is the

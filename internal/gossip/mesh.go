@@ -220,16 +220,7 @@ func (m *Mesh) Start(ctx context.Context) error {
 	metrics.GossipMembers.Set(float64(m.members()))
 
 	if peers := m.opts.Config.Gossip.Join; len(peers) > 0 {
-		n, jerr := ml.Join(peers)
-		if jerr != nil {
-			s := jerr.Error()
-			m.joinErr.Store(&s)
-			m.log.Warn("gossip: startup join failed — the mesh is up and will still accept inbound joins",
-				"router", router, "peers", peers, "err", jerr)
-		} else {
-			m.joined.Store(true)
-			m.log.Info("gossip: joined mesh", "router", router, "peers_contacted", n, "members", m.members())
-		}
+		m.joinAsync(peers)
 	} else {
 		// A single-node mesh is a valid configuration (the first router of a
 		// fleet) and is deliberately not an error.
@@ -240,6 +231,54 @@ func (m *Mesh) Start(ctx context.Context) error {
 
 	go m.broadcastLoop(ctx)
 	return nil
+}
+
+// joinAsync contacts the configured peers without blocking Start.
+//
+// memberlist's Join is synchronous per peer, and each unreachable peer can hold
+// it for TCPTimeout (10s in DefaultLANConfig). With a handful of dead peers that
+// is minutes, during which the agent has not started measuring its own transits
+// — the wrong trade for a router agent, whose local view is useful immediately.
+//
+// The bound is honoured by racing the join against JoinTimeout: on timeout the
+// join keeps running in the background (memberlist will finish it and a late peer
+// is still a good peer), but Start returns and the loop comes up. The timeout is
+// recorded as the outcome so healthz reports a mesh that has not yet joined.
+func (m *Mesh) joinAsync(peers []string) {
+	router := m.opts.Config.RouterName
+	type result struct {
+		n   int
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		n, err := m.ml.Join(peers)
+		done <- result{n: n, err: err}
+	}()
+	go func() {
+		timer := time.NewTimer(m.opts.JoinTimeout)
+		defer timer.Stop()
+		select {
+		case r := <-done:
+			if r.err != nil {
+				s := r.err.Error()
+				m.joinErr.Store(&s)
+				m.log.Warn("gossip: startup join failed — the mesh is up and will still accept inbound joins",
+					"router", router, "peers", peers, "err", r.err)
+				return
+			}
+			m.joined.Store(true)
+			m.joinErr.Store(nil)
+			m.log.Info("gossip: joined mesh", "router", router, "peers_contacted", r.n, "members", m.members())
+		case <-timer.C:
+			s := fmt.Sprintf("join still in progress after %s", m.opts.JoinTimeout)
+			m.joinErr.Store(&s)
+			m.log.Warn("gossip: join is slow; continuing in the background",
+				"router", router, "peers", peers, "timeout", m.opts.JoinTimeout)
+		case <-m.done:
+			// Shutting down; nothing to report.
+		}
+	}()
 }
 
 // broadcastLoop puts a fresh snapshot on the mesh every interval and refreshes
@@ -255,6 +294,11 @@ func (m *Mesh) broadcastLoop(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			m.Shutdown()
+			return
+		case <-m.done:
+			// Shutdown was called directly (not via ctx). Stop ticking: every
+			// further tick would count a GossipTx for a message on a closed mesh
+			// and overwrite the GossipMembers=0 that Shutdown set.
 			return
 		case <-t.C:
 			m.broadcastOnce()

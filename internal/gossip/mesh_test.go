@@ -369,6 +369,118 @@ func TestDelegateBroadcastDedupesPerRouter(t *testing.T) {
 	newer.Finished() // must be a no-op that cannot panic
 }
 
+// TestShutdownStopsBroadcastLoop pins the fix for a directly-called Shutdown: the
+// broadcast loop must stop ticking, or it would keep incrementing GossipTx for
+// messages on a closed mesh and overwrite the GossipMembers=0 the shutdown set.
+func TestShutdownStopsBroadcastLoop(t *testing.T) {
+	if err := metrics.Register(); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	c := testConfig(t, "stop-loop")
+	m, err := New(Options{
+		Config:           c,
+		Snapshot:         func() HealthPayload { return HealthPayload{} },
+		Interval:         10 * time.Millisecond,
+		Log:              discardLogger(),
+		MemberlistConfig: memberlistConfigFor(c),
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	// A never-cancelled context: Shutdown alone must stop the loop, which is the
+	// case the finding was about.
+	ctx := context.Background()
+	if err := m.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	m.Shutdown() // direct, not via ctx
+
+	before := gossipTxCount(t)
+	time.Sleep(120 * time.Millisecond) // ~12 ticks at a 10ms interval
+	after := gossipTxCount(t)
+	if after != before {
+		t.Errorf("GossipTx advanced from %v to %v after Shutdown: the broadcast loop is still ticking", before, after)
+	}
+	if v := gossipMembersValue(t); v != 0 {
+		t.Errorf("GossipMembers = %v after Shutdown, want 0 (the loop overwrote it)", v)
+	}
+}
+
+// TestStartDoesNotBlockOnUnreachablePeers pins the JoinTimeout fix: Start must
+// return promptly even when every configured peer is dead, because the agent's
+// local measurements are useful immediately and memberlist's own per-peer
+// TCPTimeout (10s) would otherwise stall startup for minutes.
+func TestStartDoesNotBlockOnUnreachablePeers(t *testing.T) {
+	if err := metrics.Register(); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	c := testConfig(t, "slow-join")
+	// A peer that is routable but never answers on the mesh port. 192.0.2.1
+	// (TEST-NET-1) is reserved and must not be reachable, which is the point.
+	c.Gossip.Join = []string{"192.0.2.1:7946", "198.51.100.1:7946", "203.0.113.1:7946"}
+
+	m, err := New(Options{
+		Config:           c,
+		Snapshot:         func() HealthPayload { return HealthPayload{} },
+		Interval:         time.Hour,
+		JoinTimeout:      200 * time.Millisecond,
+		Log:              discardLogger(),
+		MemberlistConfig: memberlistConfigFor(c),
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer m.Shutdown()
+
+	start := time.Now()
+	if err := m.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 3*time.Second {
+		t.Errorf("Start took %v with unreachable peers; the JoinTimeout bound is not applied", elapsed)
+	}
+	// A mesh that has not joined is reported as enabled-but-not-joined, which is
+	// what healthz surfaces as degraded. The join runs in the background, so the
+	// failure is recorded shortly after Start returns; poll for it.
+	st := m.Status()
+	if !st.Enabled {
+		t.Error("Status.Enabled = false")
+	}
+	if st.Joined {
+		t.Error("Status.Joined = true despite every peer being unreachable")
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if m.Status().JoinErr != "" {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Error("Status.JoinErr stayed empty after a failed join with unreachable peers")
+}
+
+// gossipTxCount reads the current GossipTx counter value from the registry.
+func gossipTxCount(t *testing.T) float64 {
+	t.Helper()
+	fams := gatherGossipMetrics(t)
+	fam := fams["transitd_gossip_tx"]
+	if fam == nil || len(fam.GetMetric()) == 0 {
+		return 0
+	}
+	return fam.GetMetric()[0].GetCounter().GetValue()
+}
+
+// gossipMembersValue reads the current GossipMembers gauge from the registry.
+func gossipMembersValue(t *testing.T) float64 {
+	t.Helper()
+	fams := gatherGossipMetrics(t)
+	fam := fams["transitd_gossip_members"]
+	if fam == nil || len(fam.GetMetric()) == 0 {
+		return 0
+	}
+	return fam.GetMetric()[0].GetGauge().GetValue()
+}
+
 // TestNodeMetaAdvertisesSchemaVersion checks the memberlist meta tag, which is how
 // a peer sees this node's schema capability without decoding a payload.
 func TestNodeMetaAdvertisesSchemaVersion(t *testing.T) {

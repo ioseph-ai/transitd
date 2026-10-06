@@ -97,15 +97,15 @@ var (
 		Help:      "Number of alive nodes in the gossip mesh, including this router.",
 	})
 
-	// GossipRx counts gossip user messages accepted from the mesh and handed to
-	// the decode path. It is incremented once per accepted message, whatever the
-	// envelope's schema_version — a message this build does not understand still
-	// counts as received (and is separately counted per version below), because
-	// a silent drop is the failure mode the version counter exists to prevent.
+	// GossipRx counts every message that reaches the delegate's receive path,
+	// including frames that fail to decode. It is incremented before Decode so a
+	// peer streaming garbage is visible as rx traffic rather than silently
+	// disappearing; the per-version counter below is what breaks the rate down by
+	// schema, and only increments once the envelope decoded.
 	GossipRx = prometheus.NewCounter(prometheus.CounterOpts{ //nolint:promlinter // name fixed by issue #3's metric contract
 		Namespace: namespace,
 		Name:      "gossip_rx",
-		Help:      "Gossip health messages received from the mesh and accepted by the decode path.",
+		Help:      "Gossip messages received from the mesh, including frames that failed to decode.",
 	})
 
 	// GossipTx counts gossip health messages this router broadcast onto the mesh.

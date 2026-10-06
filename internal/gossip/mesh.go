@@ -102,6 +102,29 @@ type Mesh struct {
 	// dequeued by select does not do work after the stop signal.
 	stopped atomic.Bool
 
+	// aliveCount caches the alive member count. It exists because the only
+	// memberlist API that reports the count — NumMembers — takes memberlist's
+	// nodeLock, and memberlist runs this mesh's event callbacks (NotifyJoin,
+	// NotifyLeave, NotifyUpdate) while holding that same lock. Reading the
+	// count from a callback is therefore a self-deadlock on a non-reentrant
+	// RWMutex: `deadNode` holds nodeLock across NotifyLeave, our callback asked
+	// memberlist for the count, and Shutdown — which reaches Leave() — never
+	// returned, so SIGTERM had to be escalated to SIGKILL.
+	//
+	// The count is refreshed only from goroutines that hold no memberlist lock
+	// (the broadcast loop), and every reader — Status, Members, and the
+	// broadcast queue's NumNodes closure — takes it from here without touching
+	// memberlist. memberlist's own internal queue does the same thing with its
+	// atomic node estimate, for the same reason.
+	aliveCount atomic.Int64
+
+	// wake asks the broadcast loop to refresh aliveCount now, rather than
+	// making the next tick wait up to a full interval. The buffer of one makes
+	// it a coalescing signal: a burst of membership events costs one refresh.
+	// Event callbacks send to it without blocking and without reading any
+	// memberlist state, which is what keeps them safe to run under nodeLock.
+	wake chan struct{}
+
 	joined  atomic.Bool
 	joinErr atomic.Pointer[string]
 
@@ -128,6 +151,7 @@ func New(opts Options) (*Mesh, error) {
 		log:  opts.Log,
 		done: make(chan struct{}),
 		stop: make(chan struct{}),
+		wake: make(chan struct{}, 1),
 	}
 	if m.log == nil {
 		m.log = slog.Default()
@@ -150,7 +174,11 @@ func (m *Mesh) Enabled() bool { return m.opts.Config.Gossip.Enabled() }
 // operator-controlled transport, which is the deployment this agent assumes.
 func (m *Mesh) memberlistConfig() (*memberlist.Config, error) {
 	if m.opts.MemberlistConfig != nil {
-		return m.opts.MemberlistConfig, nil
+		// An override replaces the transport settings, not this mesh's own
+		// wiring: the event delegate goes on below either way.
+		ml := *m.opts.MemberlistConfig
+		ml.Events = &eventDelegate{mesh: m}
+		return &ml, nil
 	}
 	c := m.opts.Config
 	key, err := c.Gossip.KeyBytes()
@@ -180,6 +208,12 @@ func (m *Mesh) memberlistConfig() (*memberlist.Config, error) {
 	// level so transport chatter stays out of an operator's log but is available
 	// when someone debugs a join. memberlist logs addresses, never key bytes.
 	ml.LogOutput = logAdapter{log: m.log}
+	// The event delegate is installed here, on BOTH the derived and the override
+	// path, and it is what makes the member gauge follow joins and leaves between
+	// broadcast ticks. It must never be skipped: while tests could replace the
+	// whole config, Events stayed nil and no test ran a memberlist callback at
+	// all, which is how a callback that re-entered memberlist's node lock and
+	// deadlocked Shutdown passed CI green.
 	ml.Events = &eventDelegate{mesh: m}
 	return ml, nil
 }
@@ -217,8 +251,11 @@ func (m *Mesh) Start(ctx context.Context) error {
 	}
 	// The retransmit limit is a function of cluster size, so the queue asks the
 	// mesh for it. Before the mesh exists the honest answer is 1 (this node).
+	// It reads the cached count, not memberlist: the queue is consulted from
+	// memberlist's send paths, and a lock taken there would be one more way to
+	// re-enter nodeLock.
 	m.del.queue = &memberlist.TransmitLimitedQueue{
-		NumNodes: func() int { return m.members() },
+		NumNodes: func() int { return m.cachedMembers() },
 	}
 	if mlConf.RetransmitMult > 0 {
 		m.del.queue.RetransmitMult = mlConf.RetransmitMult
@@ -234,7 +271,10 @@ func (m *Mesh) Start(ctx context.Context) error {
 		return fmt.Errorf("gossip: creating mesh: %w", err)
 	}
 	m.ml = ml
-	metrics.GossipMembers.Set(float64(m.members()))
+	// This runs on the Start goroutine, which holds no memberlist lock, so
+	// asking memberlist for the count here is safe; every later refresh does the
+	// same from the broadcast loop.
+	m.refreshMembers()
 
 	if peers := m.opts.Config.Gossip.Join; len(peers) > 0 {
 		m.joinAsync(peers)
@@ -295,7 +335,7 @@ func (m *Mesh) joinAsync(peers []string) {
 			}
 			m.joined.Store(true)
 			m.joinErr.Store(nil)
-			m.log.Info("gossip: joined mesh", "router", router, "peers_contacted", r.n, "members", m.members())
+			m.log.Info("gossip: joined mesh", "router", router, "peers_contacted", r.n, "members", m.cachedMembers())
 		case <-timer.C:
 			s := fmt.Sprintf("join still in progress after %s", m.opts.JoinTimeout)
 			m.joinErr.Store(&s)
@@ -332,6 +372,15 @@ func (m *Mesh) broadcastLoop(ctx context.Context) {
 			// Shutdown was called directly (not via ctx), or by another path. Stop
 			// ticking; Shutdown is waiting on loopExited.
 			return
+		case <-m.wake:
+			// A membership change asked for an out-of-band refresh. This branch
+			// must come before a tick, so a join or a leave is counted as soon as
+			// the loop is free rather than at the next tick. The count is read
+			// here, on this goroutine, and never from the callback that woke us.
+			if m.stopped.Load() {
+				return
+			}
+			m.refreshMembers()
 		case <-t.C:
 			if m.stopped.Load() {
 				return
@@ -345,7 +394,10 @@ func (m *Mesh) broadcastOnce() {
 	if m.stopped.Load() {
 		return
 	}
-	metrics.GossipMembers.Set(float64(m.members()))
+	// Refresh the count on every tick as well as on a wake-up: a peer that
+	// disappears without a leave (a partition, a crash) is only visible through
+	// memberlist's own probe timeout, which has no event to notify us.
+	m.refreshMembers()
 	msg, err := Encode(m.opts.Config.RouterName, time.Now(), m.opts.Snapshot())
 	if err != nil {
 		// The payload is built entirely from local values, so an encode error is a
@@ -358,9 +410,26 @@ func (m *Mesh) broadcastOnce() {
 	metrics.GossipTx.Inc()
 }
 
-// members returns the alive member count, or 1 (just this node) before the
-// memberlist exists. The floor of 1 matters: a gauge reading 0 would look like a
-// fully partitioned fleet rather than "not started yet".
+// refreshMembers reads the alive member count from memberlist and publishes it to
+// the gauge and to the cached count every other reader uses.
+//
+// It MUST NOT be called from a memberlist event callback: NumMembers takes
+// memberlist's nodeLock, and memberlist invokes those callbacks while holding it,
+// so a callback that calls this deadlocks the mesh against itself. The event
+// callbacks wake the broadcast loop instead, and this runs on the loop's
+// goroutine.
+func (m *Mesh) refreshMembers() {
+	n := m.members()
+	m.aliveCount.Store(int64(n))
+	metrics.GossipMembers.Set(float64(n))
+}
+
+// members reads the alive member count from memberlist, or 1 (just this node)
+// before the memberlist exists. The floor of 1 matters: a gauge reading 0 would
+// look like a fully partitioned fleet rather than "not started yet".
+//
+// It takes memberlist's nodeLock, so it is only safe on a goroutine that holds no
+// memberlist lock. Readers on the event path use cachedMembers.
 func (m *Mesh) members() int {
 	if m.ml == nil {
 		return 1
@@ -371,15 +440,27 @@ func (m *Mesh) members() int {
 	return 1
 }
 
+// cachedMembers returns the last observed alive member count without touching
+// memberlist, so it is safe to call from any goroutine, including from inside a
+// memberlist event callback. Before the first refresh it reports 1: the local node
+// is always a member, and reporting 0 out of the gate would read as a partitioned
+// fleet.
+func (m *Mesh) cachedMembers() int {
+	if n := m.aliveCount.Load(); n > 0 {
+		return int(n)
+	}
+	return 1
+}
+
 // Members returns the current alive member count, including this router.
-func (m *Mesh) Members() int { return m.members() }
+func (m *Mesh) Members() int { return m.cachedMembers() }
 
 // Status reports the mesh's observable state.
 func (m *Mesh) Status() Status {
 	s := Status{
 		Enabled: m.opts.Config.Gossip.Enabled(),
 		Joined:  m.joined.Load(),
-		Members: m.members(),
+		Members: m.cachedMembers(),
 	}
 	if p := m.joinErr.Load(); p != nil {
 		s.JoinErr = *p
@@ -423,12 +504,22 @@ func (m *Mesh) Shutdown() {
 		// A clean leave tells peers this node is gone, rather than making them
 		// suspect it for a probe timeout. The timeout is short because a shutting
 		// down router must not hang on an unreachable peer.
+		//
+		// Leave reaches memberlist's deadNode, which notifies this mesh's
+		// NotifyLeave WHILE HOLDING nodeLock. That callback only signals the
+		// broadcast loop (already stopped above), so it takes no lock and cannot
+		// deadlock this call — the bug this fixes.
 		if err := m.ml.Leave(2 * time.Second); err != nil {
 			m.log.Debug("gossip: leave broadcast did not complete", "err", err)
 		}
 		if err := m.ml.Shutdown(); err != nil {
 			m.log.Warn("gossip: shutdown", "err", err)
 		}
+		// The mesh is gone: neither the count nor the gauge may outlive it. The
+		// cached count drops to 0, and cachedMembers still floors a reader at 1
+		// so a scrape of a shut-down router cannot read as a fully partitioned
+		// fleet.
+		m.aliveCount.Store(0)
 		metrics.GossipMembers.Set(0)
 	})
 }
@@ -549,14 +640,30 @@ func (b *healthBroadcast) Name() string { return b.router }
 
 // eventDelegate keeps the member gauge current between broadcast ticks. Without
 // it, a member joining just after a tick would go uncounted for a full interval.
+//
+// Every method here runs INSIDE memberlist, while memberlist holds its node lock
+// (deadNode holds nodeLock across NotifyLeave; aliveNode holds it across
+// NotifyJoin and NotifyUpdate). Nothing in this type may call back into
+// memberlist — NumMembers and Members both take that same non-reentrant lock —
+// and nothing may block: a callback that acquires the lock or waits re-deadlocks
+// the mesh, which is exactly how Shutdown used to hang forever on Leave. The only
+// safe move is a non-blocking signal to the broadcast loop, which reads the count
+// on a goroutine that holds no memberlist lock.
 type eventDelegate struct{ mesh *Mesh }
 
-func (e *eventDelegate) NotifyJoin(_ *memberlist.Node)   { e.refresh() }
-func (e *eventDelegate) NotifyLeave(_ *memberlist.Node)  { e.refresh() }
-func (e *eventDelegate) NotifyUpdate(_ *memberlist.Node) { e.refresh() }
+func (e *eventDelegate) NotifyJoin(_ *memberlist.Node)   { e.mesh.requestRefresh() }
+func (e *eventDelegate) NotifyLeave(_ *memberlist.Node)  { e.mesh.requestRefresh() }
+func (e *eventDelegate) NotifyUpdate(_ *memberlist.Node) { e.mesh.requestRefresh() }
 
-func (e *eventDelegate) refresh() {
-	metrics.GossipMembers.Set(float64(e.mesh.members()))
+// requestRefresh asks the broadcast loop to re-read the member count now. It is
+// safe on the memberlist event path twice over: it reads no memberlist state, so
+// it cannot re-enter nodeLock, and the buffered send never blocks, so it cannot
+// stall memberlist's receive path. A burst of events coalesces into one refresh.
+func (m *Mesh) requestRefresh() {
+	select {
+	case m.wake <- struct{}{}:
+	default: // a refresh is already pending; one is enough
+	}
 }
 
 // logAdapter writes memberlist's stdlib log lines into the mesh's slog logger at

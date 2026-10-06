@@ -49,5 +49,4 @@ Not yet — pre-release. See [docs/design.md](docs/design.md).
 
 ## License
 
-MIT (see LICENSE). Dependencies keep their own licenses
-(memberlist is MPL-2.0).
+MIT (see LICENSE).

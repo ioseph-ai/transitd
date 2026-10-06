@@ -62,9 +62,12 @@ fmt:
 vulncheck:
 	$(GOVULNCHECK) $(PKG)
 
-# golden-update regenerates golden vtysh batches. Detect the "no golden tests
-# yet" case explicitly and report it; a real TestGolden failure still fails,
-# and a discovery failure (go test -list) propagates instead of reading as 0.
+# golden-update regenerates committed golden fixtures. The decide regression
+# baseline (internal/decide/testdata/golden/decide) is the current user: the
+# TestGoldenDecide harness rebuilds each scenario file from the engine's actual
+# output when UPDATE_GOLDEN=1. Detect the "no golden tests yet" case explicitly
+# and report it; a real TestGolden failure still fails, and a discovery failure
+# (go test -list) propagates instead of reading as 0.
 golden-update:
 	@list="$$($(GO) test $(PKG) -list 'TestGolden')" || exit $$?; \
 	if [[ "$$(printf '%s\n' "$$list" | grep -c '^TestGolden')" -eq 0 ]]; then \

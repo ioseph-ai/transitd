@@ -1,0 +1,44 @@
+{
+  "name": "no-eligible-transit",
+  "description": "Every transit is hard-down: no eligible set, so no LP changes are emitted and the incumbent is reported with an explicit reason.",
+  "config": {
+    "base_lp": 200,
+    "lp_step": 50,
+    "margin_ms": 10,
+    "win_cycles": 2,
+    "dwell_seconds": 60,
+    "max_switches": 2,
+    "loss_drop_pct": 5
+  },
+  "state": {
+    "primary": "a",
+    "last_switch_ago_seconds": 3600,
+    "switch_hour_wnd": 0,
+    "frozen": false
+  },
+  "steps": [
+    {
+      "health": [
+        {
+          "name": "a",
+          "session_up": false,
+          "loss_pct": 0,
+          "ewma_ms": 0
+        },
+        {
+          "name": "b",
+          "session_up": false,
+          "loss_pct": 0,
+          "ewma_ms": 0
+        }
+      ],
+      "expect": {
+        "primary": "a",
+        "switched": false,
+        "reason": "no eligible transit",
+        "frozen": false,
+        "assigned_lp": {}
+      }
+    }
+  ]
+}

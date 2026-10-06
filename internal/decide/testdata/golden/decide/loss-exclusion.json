@@ -1,0 +1,46 @@
+{
+  "name": "loss-exclusion",
+  "description": "Incumbent is session-up but its loss is at or above loss_drop_pct, so rank() excludes it and the engine treats it as not incumbent-up: the challenger takes over after dwell.",
+  "config": {
+    "base_lp": 200,
+    "lp_step": 50,
+    "margin_ms": 10,
+    "win_cycles": 2,
+    "dwell_seconds": 60,
+    "max_switches": 2,
+    "loss_drop_pct": 5
+  },
+  "state": {
+    "primary": "a",
+    "last_switch_ago_seconds": 3600,
+    "switch_hour_wnd": 0,
+    "frozen": false
+  },
+  "steps": [
+    {
+      "health": [
+        {
+          "name": "a",
+          "session_up": true,
+          "loss_pct": 30,
+          "ewma_ms": 5
+        },
+        {
+          "name": "b",
+          "session_up": true,
+          "loss_pct": 0,
+          "ewma_ms": 100
+        }
+      ],
+      "expect": {
+        "primary": "b",
+        "switched": true,
+        "reason": "incumbent hard-down or loss-excluded",
+        "frozen": false,
+        "assigned_lp": {
+          "b": 200
+        }
+      }
+    }
+  ]
+}

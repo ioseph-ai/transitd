@@ -7,6 +7,15 @@ import (
 	"github.com/ioseph-ai/transitd/internal/config"
 )
 
+// The scenario behaviors that used to live here (initial adoption, margin
+// hysteresis, challenger win cycles, dwell suppression, hard-down failover,
+// loss exclusion, freeze-after-max-switches, no-eligible-transit) are now the
+// byte-exact golden baseline in testdata/golden/decide, enforced by
+// TestGoldenDecide. This file keeps the shared fixtures plus the small unit
+// invariants that read more clearly as code than as a golden document: the
+// ranking tie-break, the exclusive loss boundary, LP ladder arithmetic, and
+// the first-boot no-op.
+
 func testCfg() *config.Config {
 	c := &config.Config{
 		RouterName:  "r-test",
@@ -27,102 +36,85 @@ func health(name string, up bool, loss float64, ewma float64) TransitHealth {
 	return TransitHealth{Name: name, SessionUp: up, LossPct: loss, EwmaMs: ewma}
 }
 
-func TestInitialAdoption(t *testing.T) {
+// TestRankTieBreakByName pins the total order: equal EWMA sorts by name so the
+// ranking is deterministic regardless of input order.
+func TestRankTieBreakByName(t *testing.T) {
 	e := NewEngine(testCfg(), &State{})
-	d := e.Evaluate([]TransitHealth{
-		health("a", true, 0, 40),
-		health("b", true, 0, 20),
+	ranked := e.rank([]TransitHealth{
+		health("zebra", true, 0, 20),
+		health("alpha", true, 0, 20),
+		health("mid", true, 0, 20),
 	})
-	if !d.Switched || d.Primary != "b" {
-		t.Fatalf("want initial adoption of b, got %+v", d)
-	}
-	if d.AssignedLP["b"] != 200 || d.AssignedLP["a"] != 150 {
-		t.Fatalf("LP ladder wrong: %+v", d.AssignedLP)
+	want := []string{"alpha", "mid", "zebra"}
+	if got := names(ranked); !equalStrings(got, want) {
+		t.Fatalf("rank order = %v, want %v", got, want)
 	}
 }
 
-func TestIncumbentMarginHysteresis(t *testing.T) {
+// TestLossBoundaryIsExclusive documents the loss_drop_pct contract: the
+// threshold is inclusive on the drop side, so a transit exactly at the limit
+// is excluded and only strictly-lower loss stays eligible.
+func TestLossBoundaryIsExclusive(t *testing.T) {
 	cfg := testCfg()
-	e := NewEngine(cfg, &State{Primary: "a", LastSwitch: time.Now().Add(-10 * time.Minute)})
-	// b beats a by less than margin: no switch even after many cycles
-	for i := 0; i < 5; i++ {
-		d := e.Evaluate([]TransitHealth{
-			health("a", true, 0, 30),
-			health("b", true, 0, 25), // margin 5 < 10
-		})
-		if d.Switched {
-			t.Fatalf("switched without margin on cycle %d", i)
+	e := NewEngine(cfg, &State{})
+	ranked := e.rank([]TransitHealth{
+		health("at-limit", true, cfg.LossDropPct, 10),
+		health("over", true, cfg.LossDropPct+0.1, 10),
+		health("under", true, cfg.LossDropPct-0.1, 10),
+	})
+	got := names(ranked)
+	if len(got) != 1 || got[0] != "under" {
+		t.Fatalf("eligible = %v, want only [under] (>= loss_drop_pct is excluded)", got)
+	}
+}
+
+// TestLPLadderDescendsByStep checks the LP assignment arithmetic across a
+// ranking longer than the two-transit goldens exercise.
+func TestLPLadderDescendsByStep(t *testing.T) {
+	e := NewEngine(testCfg(), &State{})
+	d := e.Evaluate([]TransitHealth{
+		health("first", true, 0, 10),
+		health("second", true, 0, 20),
+		health("third", true, 0, 30),
+	})
+	if d.Primary != "first" {
+		t.Fatalf("primary = %q, want first", d.Primary)
+	}
+	want := map[string]int{"first": 200, "second": 150, "third": 100}
+	for name, lp := range want {
+		if d.AssignedLP[name] != lp {
+			t.Fatalf("LP[%q] = %d, want %d (full %v)", name, d.AssignedLP[name], lp, d.AssignedLP)
 		}
 	}
 }
 
-func TestChallengerWinCycles(t *testing.T) {
-	cfg := testCfg()
-	e := NewEngine(cfg, &State{Primary: "a", LastSwitch: time.Now().Add(-10 * time.Minute)})
-	var d Decision
-	for i := 0; i < cfg.WinCycles; i++ {
-		d = e.Evaluate([]TransitHealth{
-			health("a", true, 0, 50),
-			health("b", true, 0, 10), // margin 40 >= 10
-		})
-	}
-	if !d.Switched || d.Primary != "b" {
-		t.Fatalf("want switch to b after %d cycles, got %+v", cfg.WinCycles, d)
-	}
-}
-
-func TestDwellBlocksSwitch(t *testing.T) {
-	cfg := testCfg()
-	e := NewEngine(cfg, &State{Primary: "a", LastSwitch: time.Now()}) // just switched
-	d := e.Evaluate([]TransitHealth{
-		health("a", false, 0, 0), // incumbent hard down
-		health("b", true, 0, 10),
-	})
-	if d.Switched {
-		t.Fatalf("dwell violated: %+v", d)
-	}
-}
-
-func TestHardDownForcesSwitchAfterDwell(t *testing.T) {
-	cfg := testCfg()
-	e := NewEngine(cfg, &State{Primary: "a", LastSwitch: time.Now().Add(-time.Hour)})
-	d := e.Evaluate([]TransitHealth{
-		health("a", false, 0, 0),
-		health("b", true, 0, 10),
-	})
-	if !d.Switched || d.Primary != "b" {
-		t.Fatalf("hard-down must switch immediately past dwell: %+v", d)
-	}
-}
-
-func TestLossExclusion(t *testing.T) {
-	e := NewEngine(testCfg(), &State{Primary: "a", LastSwitch: time.Now().Add(-time.Hour)})
-	d := e.Evaluate([]TransitHealth{
-		health("a", true, 30, 5), // high loss -> excluded
-		health("b", true, 0, 100),
-	})
-	if !d.Switched || d.Primary != "b" {
-		t.Fatalf("loss-excluded incumbent must lose: %+v", d)
-	}
-}
-
-func TestFreezeAfterMaxSwitches(t *testing.T) {
-	cfg := testCfg()
-	st := &State{Primary: "a", LastSwitch: time.Now().Add(-time.Hour), SwitchHourWnd: cfg.MaxSwitches}
-	e := NewEngine(cfg, st)
-	d := e.Evaluate([]TransitHealth{
-		health("a", false, 0, 0),
-		health("b", true, 0, 10),
-	})
-	if d.Switched || !d.Frozen {
-		t.Fatalf("must freeze above max switches: %+v", d)
-	}
-}
-
-func TestNoEligibleTransit(t *testing.T) {
-	e := NewEngine(testCfg(), &State{Primary: "a", LastSwitch: time.Now().Add(-time.Hour)})
+// TestInitialAdoptionNoEligibleTransit covers first boot with every transit
+// down: nothing is adopted, no LP is emitted, and no reason is raised because
+// there was no incumbent to defend.
+func TestInitialAdoptionNoEligibleTransit(t *testing.T) {
+	e := NewEngine(testCfg(), &State{})
 	d := e.Evaluate([]TransitHealth{health("a", false, 0, 0), health("b", false, 0, 0)})
-	if len(d.AssignedLP) != 0 {
-		t.Fatalf("no LP changes expected: %+v", d.AssignedLP)
+	if d.Primary != "" || d.Switched || len(d.AssignedLP) != 0 {
+		t.Fatalf("first boot with no eligible transit must be a no-op: %+v", d)
 	}
+}
+
+func names(hs []TransitHealth) []string {
+	out := make([]string, len(hs))
+	for i, h := range hs {
+		out[i] = h.Name
+	}
+	return out
+}
+
+func equalStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }

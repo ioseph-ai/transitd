@@ -9,9 +9,25 @@ builds:
     goarch: [amd64, arm64]
     flags: [-trimpath]
     ldflags: ["-s -w -X main.version={{.Version}}"]
+  # transitctl is the operator's control-channel client (issue #2). It is a
+  # separate binary on purpose: it ships to an operator's workstation or a
+  # management host, not to the routers, so bundling it into the transitd image
+  # would put an unused CLI on every router. It shares the version ldflag so
+  # `transitctl --version` and `transitd --version` agree.
+  - id: transitctl
+    main: ./cmd/transitctl
+    binary: transitctl
+    env: [CGO_ENABLED=0]
+    goos: [linux]
+    goarm: ["6", "8"]
+    goarch: [amd64, arm64]
+    flags: [-trimpath]
+    ldflags: ["-s -w -X main.version={{.Version}}"]
 archives:
+  # One archive per platform carrying both binaries: an operator unpacks one
+  # tarball and has the agent and its client for the same version.
   - id: transitd
-    builds: [transitd]
+    builds: [transitd, transitctl]
     name_template: "{{ .ProjectName }}_{{ .Os }}_{{ .Arch }}{{ if .Arm }}v{{ .Arm }}{{ end }}"
 checksum:
   name_template: checksums.txt

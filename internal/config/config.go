@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"fmt"
 	"net"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
@@ -94,6 +95,61 @@ type Gossip struct {
 // GossipBindPortDefault is the memberlist default mesh port.
 const GossipBindPortDefault = 7946
 
+// Control configures the local control channel (issue #2): the unix socket
+// `transitctl` talks to. It is local-only in this MVP — a later PR adds remote
+// invocation over the gossip mesh (see internal/ctrl/PROTOCOL.md).
+//
+// The channel has no switch of its own: it authenticates every request with the
+// gossip shared key, so it exists exactly when a mesh key is configured. That
+// ties the control plane's existence to the secret that protects it, and means a
+// single-router deployment with no mesh opens no extra socket at all. An
+// operator who writes a socket_path without a key gets a startup error rather
+// than a silently unauthenticated channel.
+type Control struct {
+	// SocketPath is the unix socket the agent serves on. Empty means
+	// DefaultControlSocket.
+	SocketPath string `yaml:"socket_path"`
+}
+
+// DefaultControlSocket is the control channel's socket path when the config
+// does not name one. It lives under /run rather than /var/run because it is a
+// runtime object: it does not survive a reboot and should not be backed up.
+const DefaultControlSocket = "/run/transitd/ctrl.sock"
+
+// controlSocketPathMax is the longest accepted socket path. The kernel copies
+// the path into sockaddr_un.sun_path, which is 108 bytes on Linux including the
+// NUL; leaving headroom turns a bind failure with a cryptic "invalid argument"
+// into a startup error that names the path and its limit.
+const controlSocketPathMax = 100
+
+// SocketPathOrDefault returns the configured socket path, or the default when
+// the config leaves it unset.
+func (c *Control) SocketPathOrDefault() string {
+	if p := strings.TrimSpace(c.SocketPath); p != "" {
+		return p
+	}
+	return DefaultControlSocket
+}
+
+// validate checks the control block's structural invariants. The block is
+// optional; an unset socket_path is valid and means the default path.
+func (c *Control) validate() error {
+	p := strings.TrimSpace(c.SocketPath)
+	if p == "" {
+		return nil
+	}
+	if !filepath.IsAbs(p) {
+		return fmt.Errorf("control.socket_path %q is not an absolute path — the agent's working directory is not stable, so a relative socket would land somewhere unpredictable", p)
+	}
+	if len(p) > controlSocketPathMax {
+		return fmt.Errorf("control.socket_path is %d bytes; a unix socket path must fit in 108 bytes including the terminator (maximum accepted here is %d)", len(p), controlSocketPathMax)
+	}
+	if filepath.Clean(p) == "/" {
+		return fmt.Errorf("control.socket_path %q is a directory, not a socket path", p)
+	}
+	return nil
+}
+
 // Enabled reports whether the operator configured a mesh. An empty key means no
 // mesh: the agent then runs with no peers rather than joining with a zero key
 // (which memberlist would treat as no encryption at all).
@@ -166,6 +222,11 @@ type Config struct {
 	// Gossip groups the mesh protocol settings.
 	Gossip Gossip `yaml:"gossip"`
 
+	// Control groups the local control channel settings (issue #2). The channel
+	// reuses the gossip shared key for authentication, so it is only available
+	// when a mesh key is configured.
+	Control Control `yaml:"control"`
+
 	// Decision tuning.
 	BaseLP      int           `yaml:"base_lp"`               // LP for rank 1 (default 200)
 	LPStep      int           `yaml:"lp_step"`               // LP decrement per rank (default 50)
@@ -218,6 +279,17 @@ func (c *Config) Validate() error {
 	}
 	if err := c.Gossip.validate(); err != nil {
 		return err
+	}
+	if err := c.Control.validate(); err != nil {
+		return err
+	}
+	// The control channel authenticates with the gossip shared key, so a
+	// configured socket without a mesh key is a half-configured control plane:
+	// the operator meant to expose a control endpoint and would otherwise get
+	// either an unauthenticated one or a silent no-op. Refuse it, like gossip.join
+	// without a key.
+	if strings.TrimSpace(c.Control.SocketPath) != "" && !c.Gossip.Enabled() {
+		return fmt.Errorf("control.socket_path is set but gossip.key is empty — the control channel authenticates with the gossip shared key, so set a key or remove the socket_path to expose no control plane")
 	}
 	if len(c.Transits) < 1 {
 		return fmt.Errorf("at least one transit is required")

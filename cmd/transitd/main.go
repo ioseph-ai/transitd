@@ -55,7 +55,15 @@ func run(cfgPath string, interval time.Duration) error {
 		return err
 	}
 
-	ag, err := agent.New(agent.Options{Config: cfg, Interval: interval})
+	// The local control channel (issue #2) exists exactly when a mesh key is
+	// configured: it authenticates with that key, so an agent with no key has
+	// nothing to protect a control endpoint with. The socket path comes from
+	// control.socket_path (default /run/transitd/ctrl.sock).
+	ag, err := agent.New(agent.Options{
+		Config:        cfg,
+		Interval:      interval,
+		ControlSocket: cfg.Gossip.Enabled(),
+	})
 	if err != nil {
 		return err
 	}

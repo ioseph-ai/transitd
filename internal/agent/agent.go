@@ -32,6 +32,7 @@ import (
 
 	"github.com/ioseph-ai/transitd/internal/bgpwatch"
 	"github.com/ioseph-ai/transitd/internal/config"
+	"github.com/ioseph-ai/transitd/internal/ctrl"
 	"github.com/ioseph-ai/transitd/internal/decide"
 	"github.com/ioseph-ai/transitd/internal/gossip"
 	"github.com/ioseph-ai/transitd/internal/health"
@@ -67,6 +68,11 @@ const (
 	// appear as broken. Once wired it is degraded until the first session
 	// observation arrives, so "enabled but not answering" stays visible.
 	featureBgpwatch = "bgpwatch"
+	// featureControl is the local control channel (issue #2). It is only
+	// registered when the operator asked for a control socket: a capability
+	// the deployment did not enable must not appear as broken. Once serving
+	// it is enabled; asked-for-but-not-up is degraded with a reason.
+	featureControl = "control"
 )
 
 // Health is the /healthz payload. Status is the overall verdict; Features
@@ -91,6 +97,26 @@ type Health struct {
 	// router with no mesh configured omits the field entirely, which is
 	// distinguishable from a mesh that is configured and failing to join.
 	Gossip *GossipHealth `json:"gossip,omitempty"`
+	// Control reports the local control channel's state (issue #2). Like Gossip it
+	// is a pointer so a router with no channel configured omits it.
+	Control *ControlHealth `json:"control,omitempty"`
+	// DesiredPrimary is the transit an operator last asked for over the control
+	// channel, empty when none has asked. It is surfaced here because in this
+	// observe-only build a recorded preference is a real piece of agent state that
+	// is otherwise invisible in a scrape.
+	DesiredPrimary string `json:"desired_primary,omitempty"`
+}
+
+// ControlHealth is the control channel's entry in the healthz payload.
+type ControlHealth struct {
+	// Enabled is whether the channel is configured. It is always true when this
+	// object is present, carried explicitly so a consumer reads one object.
+	Enabled bool `json:"enabled"`
+	// Socket is the socket path the channel serves on, so an operator can point
+	// `transitctl` at the agent without reading its config.
+	Socket string `json:"socket"`
+	// DesiredPrimary is the last requested preference, empty when none.
+	DesiredPrimary string `json:"desired_primary,omitempty"`
 }
 
 // GossipHealth is the mesh's entry in the healthz payload. It mirrors
@@ -165,6 +191,12 @@ type Options struct {
 	// Mesh is an override for the gossip mesh, for tests. Nil means the agent
 	// builds one from Config.Gossip when that is enabled.
 	Mesh *gossip.Mesh
+
+	// ControlSocket, when true, starts the local control channel (issue #2). It is
+	// a bool rather than a *ctrl.Server because the server must be built after the
+	// agent it reports on, so the agent constructs it; a test that wants the
+	// channel just turns it on. The socket path and key come from Config.
+	ControlSocket bool
 }
 
 // Agent owns the probe supervisor and the decision engine, and is the driver
@@ -238,6 +270,17 @@ type Agent struct {
 	// so it is the one place the two need an atomic hand-off. Storing the whole
 	// immutable payload keeps the mesh from ever reading a half-updated view.
 	snap atomic.Pointer[gossip.HealthPayload]
+
+	// controlWanted is whether the caller asked for the local control channel
+	// (issue #2). The server itself is built in Start, like the mesh, so New stays
+	// free of sockets.
+	controlWanted bool
+	// ctrlSrv is the running control channel, nil when none was started.
+	ctrlSrv *ctrl.Server
+	// desired is the transit an operator last requested over the control channel.
+	// It is an atomic pointer because the control server's handler goroutine writes
+	// it while Health — called from the HTTP handler goroutine — reads it.
+	desired atomic.Pointer[string]
 }
 
 // New validates cfg and wires the observe-only pipeline. It registers the
@@ -255,18 +298,19 @@ func New(opts Options) (*Agent, error) {
 	}
 
 	a := &Agent{
-		cfg:         opts.Config,
-		log:         opts.Log,
-		interval:    opts.Interval,
-		engine:      decide.NewEngine(opts.Config, &decide.State{WinStreak: map[string]int{}}),
-		samples:     make(chan probes.Sample, 64),
-		obs:         make(map[string]probes.Sample, len(opts.Config.Transits)),
-		sessions:    make(map[string]bgpwatch.Session),
-		sessionCh:   make(chan bgpwatch.Session, 64),
-		probeBinary: opts.ProbeBinary,
-		lookPath:    opts.LookPath,
-		mesh:        opts.Mesh,
-		onPeer:      opts.OnPeer,
+		cfg:           opts.Config,
+		log:           opts.Log,
+		interval:      opts.Interval,
+		engine:        decide.NewEngine(opts.Config, &decide.State{WinStreak: map[string]int{}}),
+		samples:       make(chan probes.Sample, 64),
+		obs:           make(map[string]probes.Sample, len(opts.Config.Transits)),
+		sessions:      make(map[string]bgpwatch.Session),
+		sessionCh:     make(chan bgpwatch.Session, 64),
+		probeBinary:   opts.ProbeBinary,
+		lookPath:      opts.LookPath,
+		mesh:          opts.Mesh,
+		onPeer:        opts.OnPeer,
+		controlWanted: opts.ControlSocket,
 	}
 	if a.log == nil {
 		a.log = slog.Default()
@@ -328,6 +372,13 @@ func New(opts Options) (*Agent, error) {
 		// registered: a capability this deployment does not use must not drag
 		// the status down.
 		a.reg.Register(featureGossip, health.Degraded, "gossip mesh configured but not started yet")
+	}
+	if a.controlWanted {
+		// The operator asked for the local control channel. It is started by
+		// Start (startControl); until then it is degraded-with-reason on the
+		// same pattern as the gossip pre-registration above, and
+		// refreshControlFeature keeps it current once it is serving.
+		a.reg.Register(featureControl, health.Degraded, "control channel requested but not serving yet")
 	}
 	return a, nil
 }
@@ -445,7 +496,81 @@ func (a *Agent) Start(ctx context.Context) error {
 	if err := a.startMesh(ctx); err != nil {
 		return fmt.Errorf("agent: %w", err)
 	}
+	if err := a.startControl(); err != nil {
+		return fmt.Errorf("agent: %w", err)
+	}
 	return nil
+}
+
+// startControl brings up the local control channel (issue #2) when the caller
+// asked for one and the config has a key to authenticate it with. The directory,
+// socket mode and stale-socket handling all live in internal/ctrl.
+//
+// The SetPrimary hook keeps the last requested preference in the agent so /healthz
+// can report it: a recorded preference is real state, and an operator who asks for
+// one should be able to see that the agent heard them even though this build does
+// not act on it.
+func (a *Agent) startControl() error {
+	if !a.controlWanted {
+		return nil
+	}
+	if !a.cfg.Gossip.Enabled() {
+		// Validate already refuses control.socket_path without a key, so this is
+		// only reachable for a hand-built config bypassing New. Refuse it rather
+		// than open an unauthenticated socket.
+		return fmt.Errorf("control channel requested but gossip.key is empty — the channel authenticates with the shared key")
+	}
+	key, err := a.cfg.Gossip.KeyBytes()
+	if err != nil {
+		return fmt.Errorf("control channel key: %w", err)
+	}
+	known := make(map[string]bool, len(a.cfg.Transits))
+	for _, t := range a.cfg.Transits {
+		known[t.Name] = true
+	}
+	srv, err := ctrl.New(ctrl.Options{
+		SocketPath: a.cfg.Control.SocketPathOrDefault(),
+		Key:        key,
+		Router:     a.cfg.RouterName,
+		Status:     a.statusDocument,
+		KnownTransit: func(name string) bool {
+			return known[name]
+		},
+		SetPrimary: func(transit string) error {
+			a.desired.Store(&transit)
+			// Record the preference in the gauge family too: 1 for the requested
+			// transit and 0 for its peers, so a dashboard reads the operator's intent
+			// at a glance rather than from a scrape gap.
+			for name := range known {
+				if name == transit {
+					metrics.CtrlSetPrimary.WithLabelValues(name).Set(1)
+					continue
+				}
+				metrics.CtrlSetPrimary.WithLabelValues(name).Set(0)
+			}
+			return nil
+		},
+		Log: a.log,
+	})
+	if err != nil {
+		return err
+	}
+	a.ctrlSrv = srv
+	go func() {
+		if err := srv.Serve(); err != nil {
+			a.log.Error("control channel stopped with an error", "err", err)
+		}
+	}()
+	a.log.Info("control channel started (local unix socket; authenticated)",
+		"socket", srv.Addr(), "router", a.cfg.RouterName)
+	return nil
+}
+
+// statusDocument renders the healthz-equivalent JSON document for the control
+// channel. It is the same Health value /healthz serves, so a control client and a
+// scrape cannot disagree about the agent's state.
+func (a *Agent) statusDocument() (json.RawMessage, error) {
+	return json.Marshal(a.Health())
 }
 
 // startMesh brings up the gossip health mesh, if one is configured or was
@@ -552,6 +677,14 @@ func (a *Agent) Run(ctx context.Context) error {
 			// snapshot.
 			if a.mesh != nil {
 				a.mesh.Shutdown()
+			}
+			// The control channel reports on the agent's state, so it belongs to the
+			// agent's lifetime for the same reason: a channel outliving the loop
+			// would answer `status` with a frozen view.
+			if a.ctrlSrv != nil {
+				if err := a.ctrlSrv.Shutdown(); err != nil {
+					a.log.Error("control channel shutdown", "err", err)
+				}
 			}
 			return nil
 		case s := <-a.samples:
@@ -717,6 +850,7 @@ func (a *Agent) Health() Health {
 	// updates, and healthz is the natural one.
 	a.refreshGossipFeature()
 	a.refreshBgpwatchFeature()
+	a.refreshControlFeature()
 	res := a.sup.Results()
 	pin := make(map[string]bool, len(a.cfg.Transits))
 	for _, t := range a.cfg.Transits {
@@ -726,10 +860,12 @@ func (a *Agent) Health() Health {
 		pin[t.Name] = res[t.Name].Verified
 	}
 	return Health{
-		Status:      a.reg.Status(),
-		PinVerified: pin,
-		Features:    a.reg.Map(),
-		Gossip:      a.gossipHealth(),
+		Status:         a.reg.Status(),
+		PinVerified:    pin,
+		Features:       a.reg.Map(),
+		Gossip:         a.gossipHealth(),
+		Control:        a.controlHealth(),
+		DesiredPrimary: a.desiredPrimary(),
 	}
 }
 
@@ -785,6 +921,39 @@ func (a *Agent) refreshBgpwatchFeature() {
 	} else {
 		a.reg.Set(featureBgpwatch, health.Degraded, "bgpwatch poller wired but no session observation yet")
 	}
+}
+
+// controlHealth returns the control channel's entry for the healthz payload,
+// nil when no server was started. An entry means the operator's control
+// surface is live on this router and names where to find it.
+func (a *Agent) controlHealth() *ControlHealth {
+	if a.ctrlSrv == nil {
+		return nil
+	}
+	return &ControlHealth{Enabled: true, Socket: a.ctrlSrv.Addr(), DesiredPrimary: a.desiredPrimary()}
+}
+
+// refreshControlFeature folds the control channel's state into the feature
+// registry on the read-refresh pattern. A control socket that was asked for
+// but never came up is the silent failure the registry exists to surface; once
+// serving it is enabled.
+func (a *Agent) refreshControlFeature() {
+	if !a.controlWanted {
+		return
+	}
+	if a.ctrlSrv != nil {
+		a.reg.Set(featureControl, health.Enabled, "")
+	} else {
+		a.reg.Set(featureControl, health.Degraded, "control channel requested but not serving yet")
+	}
+}
+
+// desiredPrimary returns the operator's last requested preference, or "".
+func (a *Agent) desiredPrimary() string {
+	if p := a.desired.Load(); p != nil {
+		return *p
+	}
+	return ""
 }
 
 // Handler returns the agent's HTTP surface: /metrics for the Prometheus registry

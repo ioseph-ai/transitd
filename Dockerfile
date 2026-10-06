@@ -9,9 +9,11 @@
 # Base is distroless static: the binary is CGO-free and needs no libc, shell,
 # or package manager, which keeps the attack surface minimal.
 #
-# NOTE: this image intentionally ships only the transitd binary. Bundling a
-# static `ping` (a #7 container-contents decision) is out of scope for the
-# pipeline-only change in #17.
+# NOTE: this image intentionally ships only the transitd binary. transitctl (the
+# control-channel client, issue #2) is a separate release artifact: it belongs on
+# an operator's workstation or management host, not on the router, so it is not
+# copied here. Bundling a static `ping` (a #7 container-contents decision) is out
+# of scope for the pipeline-only change in #17.
 FROM gcr.io/distroless/static-debian12
 
 ARG TARGETPLATFORM

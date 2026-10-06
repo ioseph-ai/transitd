@@ -34,18 +34,21 @@ test:
 unit: test
 
 # integration drives the integration tier through docker compose and the
-# `integration` build tag. NOTE: test/compose.yaml and the tagged tests land
-# in a later PR (the integration-tier PR), not this one — until that merges
-# this target fails fast with a pointer instead of a cryptic docker error.
+# `integration` build tag. It needs only a docker daemon: the tagged tests in
+# test/integration bring the lab in test/compose.yaml up and down themselves
+# (TestMain runs `docker compose up -d --wait` and `down -v`), so this target
+# is exactly what CI runs. The `up -d` below is a warm-up so a compose failure
+# surfaces as a clear error before `go test` starts; `set -e` in the test then
+# owns the run.
 integration:
-	@if [[ ! -f test/compose.yaml ]]; then \
-		echo "integration: test/compose.yaml not found — the integration-tier PR has not landed yet"; \
+	@command -v docker >/dev/null 2>&1 || { \
+		echo "integration: docker is required for the compose lab"; \
 		exit 1; \
-	fi
+	}
 	@set -e; \
 	trap 'docker compose -f test/compose.yaml down -v' EXIT; \
-	docker compose -f test/compose.yaml up -d --wait; \
-	$(GO) test -tags=integration -count=1 $(PKG)
+	docker compose -f test/compose.yaml up -d; \
+	$(GO) test -tags=integration -count=1 ./test/...
 
 # lint runs golangci-lint with the repo config (.golangci.yml).
 lint:

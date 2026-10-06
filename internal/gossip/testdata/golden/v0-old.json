@@ -1,0 +1,8 @@
+{
+  "router": "r-old",
+  "ts": "2026-01-01T00:00:00Z",
+  "transits": [
+    {"name": "main", "session_up": true, "loss_pct": 1.5, "ewma_ms": 20}
+  ],
+  "decide": {"primary": "main", "switched": false, "reason": "incumbent retained", "frozen": false}
+}

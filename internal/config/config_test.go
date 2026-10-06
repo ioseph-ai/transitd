@@ -129,3 +129,108 @@ func TestBothAddressFamiliesAccepted(t *testing.T) {
 		t.Fatalf("v6 pinning rejected: %v", err)
 	}
 }
+
+// gossipKey is the base64 of 32 documentation bytes, for the mesh tests.
+const gossipKey = "ZXhhbXBsZS1rZXktbm90LWEtc2VjcmV0LTMyYnl0ZXM="
+
+// TestGossipDisabledByDefault pins the opt-in default: a config with no gossip
+// block runs with no mesh, and that is valid — single-router deployments exist.
+func TestGossipDisabledByDefault(t *testing.T) {
+	c := base()
+	if err := c.Validate(); err != nil {
+		t.Fatalf("mesh-less config rejected: %v", err)
+	}
+	if c.Gossip.Enabled() {
+		t.Error("Gossip.Enabled() = true with no key")
+	}
+	if got, err := c.Gossip.KeyBytes(); err != nil || got != nil {
+		t.Errorf("KeyBytes() = %v/%v, want nil/nil for a disabled mesh", got, err)
+	}
+}
+
+// TestGossipJoinWithoutKeyRejected is the half-configured-mesh guard: an operator
+// who wrote peers meant to have a mesh, and a silent no-op would leave the router
+// alone with no error to explain it.
+func TestGossipJoinWithoutKeyRejected(t *testing.T) {
+	c := base()
+	c.Gossip.Join = []string{"192.0.2.11"}
+	err := c.Validate()
+	if err == nil {
+		t.Fatal("expected an error for gossip.join with no gossip.key")
+	}
+	if !strings.Contains(err.Error(), "gossip.key") {
+		t.Errorf("error %q does not name gossip.key", err)
+	}
+}
+
+// TestGossipKeyValidation covers the key shapes memberlist accepts (16/24/32
+// bytes) and the two ways a key can be wrong: not base64, and the wrong length.
+func TestGossipKeyValidation(t *testing.T) {
+	cases := []struct {
+		name    string
+		key     string
+		wantErr string
+	}{
+		{"32 bytes", gossipKey, ""},
+		{"16 bytes", "MDEyMzQ1Njc4OWFiY2RlZg==", ""},
+		{"24 bytes", "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3", ""},
+		{"not base64", "not base64!!!", "not valid base64"},
+		{"wrong length", "c2hvcnQ=", "16, 24 or 32"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := base()
+			c.Gossip.Key = tc.key
+			err := c.Validate()
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("expected an error containing %q", tc.wantErr)
+			}
+			if !strings.Contains(err.Error(), tc.wantErr) {
+				t.Errorf("error %q does not contain %q", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+// TestGossipPortDefault checks the port default: an unset bind_port is 7946, an
+// explicit one is honoured, and an impossible one is rejected.
+func TestGossipPortDefault(t *testing.T) {
+	c := base()
+	c.Gossip.Key = gossipKey
+	if err := c.Validate(); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+	if got := c.Gossip.Port(); got != GossipBindPortDefault {
+		t.Errorf("default port = %d, want %d", got, GossipBindPortDefault)
+	}
+
+	c.Gossip.BindPort = 9100
+	if err := c.Validate(); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+	if got := c.Gossip.Port(); got != 9100 {
+		t.Errorf("explicit port = %d, want 9100", got)
+	}
+
+	c.Gossip.BindPort = 70000
+	if err := c.Validate(); err == nil {
+		t.Error("expected an error for an out-of-range gossip.bind_port")
+	}
+}
+
+// TestGossipEmptyJoinEntryRejected catches a trailing YAML dash, which yields an
+// empty string peer that memberlist would try to resolve.
+func TestGossipEmptyJoinEntryRejected(t *testing.T) {
+	c := base()
+	c.Gossip.Key = gossipKey
+	c.Gossip.Join = []string{"192.0.2.11", "  "}
+	if err := c.Validate(); err == nil {
+		t.Fatal("expected an error for an empty gossip.join entry")
+	}
+}

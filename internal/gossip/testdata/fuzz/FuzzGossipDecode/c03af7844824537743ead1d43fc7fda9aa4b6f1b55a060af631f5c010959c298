@@ -1,0 +1,2 @@
+go test fuzz v1
+[]byte("{\"schema_version\":1,\"ts\":\"2026-01-01T00:00:00Z\",\"router\":\"r-v2\",\"payload\":{\"transits\":[],\"mtu_state\":{\"main\":{\"probed\":1500}},\"tcp_signal\":{\"main\":{\"handshake_ms\":4.2}},\"maintenance\":{\"reason\":\"drill\"},\"visibility_intent\":{\"announce\":[\"192.0.2.0/24\"]}}}")

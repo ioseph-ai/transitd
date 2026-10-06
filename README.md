@@ -29,12 +29,15 @@ turning your routers into a Kubernetes cluster:
       startup pin verification, Prometheus metrics, healthz endpoint with
       [feature capability surfacing](docs/health.md), the gossip mesh between
       agents (memberlist, issue #3), the observe-only agent loop
-      (`cmd/transitd`), and bounded read-only BGP state (bgpwatch: session/
-      prefix views feeding `SessionUp`). Mutation batches (act: neighbor
-      shutdown, tcp-mss clamp) exist and are idempotent, but are deliberately
-      NOT wired to decide yet — observe-only until the wiring is
-      review-carded. Remaining P1 core: manual `transitctl set-primary <name>`
-      (issue #2), act wiring (issue #4).
+      (`cmd/transitd`), bounded read-only BGP state (bgpwatch: session/
+      prefix views feeding `SessionUp`), and the local control channel
+      (issue #2): an authenticated unix-socket server (`control.socket_path`,
+      gossip-key auth) driven by the `transitctl` client for
+      `status` / `set-primary <name>` / `ping` — observe-only, the
+      preference is recorded and surfaced, not applied. Mutation batches
+      (act: neighbor shutdown, tcp-mss clamp) exist and are idempotent, but
+      are deliberately NOT wired to decide yet — observe-only until the
+      wiring is review-carded. Remaining P1 core: act wiring (issue #4).
 - [ ] P2: automatic latency/loss-aware transit preference with
       hysteresis + minimum dwell.
 - [ ] P3: traffic engineering — per-prefix-class preferences, scheduled

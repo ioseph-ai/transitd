@@ -26,7 +26,8 @@ turning your routers into a Kubernetes cluster:
 ## Features (roadmap)
 
 - [x] P1 (partial): observation — per-transit probes (latency/loss) with
-      startup pin verification, Prometheus metrics, healthz endpoint, and the
+      startup pin verification, Prometheus metrics, healthz endpoint with
+      [feature capability surfacing](docs/health.md), and the
       observe-only agent loop (`cmd/transitd`). Remaining P1 core:
       BGP/BFD state via `show ... json`, gossip between agents (memberlist),
       manual `transitctl set-primary <name>` (issues #2, #3, #4).

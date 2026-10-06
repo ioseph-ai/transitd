@@ -1,0 +1,75 @@
+{
+  "name": "challenger-win-cycles",
+  "description": "Challenger clears the margin each cycle but must win win_cycles consecutive cycles before the switch fires: cycle 1 builds the streak (no switch), cycle 2 completes it and switches.",
+  "config": {
+    "base_lp": 200,
+    "lp_step": 50,
+    "margin_ms": 10,
+    "win_cycles": 2,
+    "dwell_seconds": 60,
+    "max_switches": 2,
+    "loss_drop_pct": 5
+  },
+  "state": {
+    "primary": "a",
+    "last_switch_ago_seconds": 600,
+    "switch_hour_wnd": 0,
+    "frozen": false
+  },
+  "steps": [
+    {
+      "health": [
+        {
+          "name": "a",
+          "session_up": true,
+          "loss_pct": 0,
+          "ewma_ms": 50
+        },
+        {
+          "name": "b",
+          "session_up": true,
+          "loss_pct": 0,
+          "ewma_ms": 10
+        }
+      ],
+      "advance_seconds": 60,
+      "expect": {
+        "primary": "a",
+        "switched": false,
+        "reason": "",
+        "frozen": false,
+        "assigned_lp": {
+          "a": 150,
+          "b": 200
+        }
+      }
+    },
+    {
+      "health": [
+        {
+          "name": "a",
+          "session_up": true,
+          "loss_pct": 0,
+          "ewma_ms": 50
+        },
+        {
+          "name": "b",
+          "session_up": true,
+          "loss_pct": 0,
+          "ewma_ms": 10
+        }
+      ],
+      "advance_seconds": 60,
+      "expect": {
+        "primary": "b",
+        "switched": true,
+        "reason": "challenger won margin for required cycles",
+        "frozen": false,
+        "assigned_lp": {
+          "a": 150,
+          "b": 200
+        }
+      }
+    }
+  ]
+}

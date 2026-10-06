@@ -1,0 +1,72 @@
+{
+  "name": "freeze-after-max-switches",
+  "description": "Switch rate limit: with switch_hour_wnd already at max_switches, a warranted failover is suppressed and the engine latches frozen. The next cycle shows the freeze still suppressing the same warranted switch because Evaluate never clears it (the window drain is owned elsewhere).",
+  "config": {
+    "base_lp": 200,
+    "lp_step": 50,
+    "margin_ms": 10,
+    "win_cycles": 2,
+    "dwell_seconds": 60,
+    "max_switches": 2,
+    "loss_drop_pct": 5
+  },
+  "state": {
+    "primary": "a",
+    "last_switch_ago_seconds": 3600,
+    "switch_hour_wnd": 2,
+    "frozen": false
+  },
+  "steps": [
+    {
+      "health": [
+        {
+          "name": "a",
+          "session_up": false,
+          "loss_pct": 0,
+          "ewma_ms": 0
+        },
+        {
+          "name": "b",
+          "session_up": true,
+          "loss_pct": 0,
+          "ewma_ms": 10
+        }
+      ],
+      "expect": {
+        "primary": "a",
+        "switched": false,
+        "reason": "switch suppressed: rate-limit freeze",
+        "frozen": true,
+        "assigned_lp": {
+          "b": 200
+        }
+      }
+    },
+    {
+      "health": [
+        {
+          "name": "a",
+          "session_up": false,
+          "loss_pct": 0,
+          "ewma_ms": 0
+        },
+        {
+          "name": "b",
+          "session_up": true,
+          "loss_pct": 0,
+          "ewma_ms": 10
+        }
+      ],
+      "advance_seconds": 3600,
+      "expect": {
+        "primary": "a",
+        "switched": false,
+        "reason": "switch suppressed: rate-limit freeze",
+        "frozen": true,
+        "assigned_lp": {
+          "b": 200
+        }
+      }
+    }
+  ]
+}

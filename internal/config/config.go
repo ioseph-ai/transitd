@@ -4,15 +4,33 @@ package config
 import (
 	"fmt"
 	"net"
+	"regexp"
 	"strings"
 	"time"
 )
 
 // Transit describes one upstream transit as seen from this router.
 type Transit struct {
-	Name          string        `yaml:"name"`
-	ImportMap     string        `yaml:"import_map"`     // route-map applied inbound from this transit
-	ProbeTargets  []string      `yaml:"probe_targets"`  // IPs pinged via this transit
+	Name      string `yaml:"name"`
+	ImportMap string `yaml:"import_map"` // route-map applied inbound from this transit
+
+	// Probe pinning (issue #1). A probe's source address selects the source
+	// IP, not the egress path: without policy routing the probe can leave
+	// through the default/ECMP path with a foreign source. ProbeSource is the
+	// transit's own interface address — it is the `from` selector of the
+	// startup `ip route get` verification and the `-I` pin of the ICMP probe.
+	// ProbeTarget is the canary destination used for both. EgressInterface is
+	// the interface the probes must actually leave through; a transit whose
+	// resolved egress does not match it is unverified and exports no samples.
+	ProbeSource     string `yaml:"probe_source"`
+	ProbeTarget     string `yaml:"probe_target"`
+	EgressInterface string `yaml:"egress_interface"`
+
+	// ProbeTargets is the anycast target set carried over from the first
+	// scaffold. The MVP probes ProbeTarget only; this stays for the later
+	// multi-target probe work and is validated when set.
+	ProbeTargets []string `yaml:"probe_targets"`
+
 	ProbeInterval time.Duration `yaml:"probe_interval"` // default 30s
 }
 
@@ -41,6 +59,13 @@ type Config struct {
 	ListenMetrics string `yaml:"listen_metrics"` // default :9414
 }
 
+// egressInterfaceRe is the accepted shape of an egress interface name. The
+// value is passed as a single argv element to `ip route get` (never through a
+// shell), but a transit whose "interface" contains whitespace, slashes or
+// control characters is a configuration bug we refuse at startup rather than
+// discover as a confusing exec failure later.
+var egressInterfaceRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.:@-]*$`)
+
 // Validate checks structural invariants. It deliberately rejects anything
 // the agent cannot apply safely at runtime.
 func (c *Config) Validate() error {
@@ -57,7 +82,8 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("at least one transit is required")
 	}
 	names := map[string]bool{}
-	for i, t := range c.Transits {
+	for i := range c.Transits {
+		t := &c.Transits[i]
 		if t.Name == "" {
 			return fmt.Errorf("transit[%d]: name is required", i)
 		}
@@ -68,10 +94,45 @@ func (c *Config) Validate() error {
 		if t.ImportMap == "" {
 			return fmt.Errorf("transit %q: import_map is required (runtime LP is written into it)", t.Name)
 		}
+		// Probe pinning fields. These are required: a transit that cannot be
+		// pinned cannot be verified, and an unverified transit must export no
+		// probe samples (issue #1). Refusing them at config time turns a
+		// silent mis-measurement into a startup error.
+		if t.ProbeSource == "" {
+			return fmt.Errorf("transit %q: probe_source is required (the transit's own interface address)", t.Name)
+		}
+		if net.ParseIP(t.ProbeSource) == nil {
+			return fmt.Errorf("transit %q: probe_source %q is not an IP", t.Name, t.ProbeSource)
+		}
+		if t.ProbeTarget == "" {
+			return fmt.Errorf("transit %q: probe_target is required", t.Name)
+		}
+		if ip := net.ParseIP(t.ProbeTarget); ip == nil {
+			return fmt.Errorf("transit %q: probe_target %q is not an IP", t.Name, t.ProbeTarget)
+		} else if src := net.ParseIP(t.ProbeSource); (src.To4() != nil) != (ip.To4() != nil) {
+			// A v4 source with a v6 target (or the reverse) cannot be pinned:
+			// the source selects a policy route within its own family, and the
+			// kernel would refuse `ip route get <v6> from <v4>`. Rejecting it
+			// here turns a per-cycle exec failure into a startup error.
+			return fmt.Errorf("transit %q: probe_source %q and probe_target %q are from different address families", t.Name, t.ProbeSource, t.ProbeTarget)
+		}
+		if t.EgressInterface == "" {
+			return fmt.Errorf("transit %q: egress_interface is required (expected egress for pin verification)", t.Name)
+		}
+		if !egressInterfaceRe.MatchString(t.EgressInterface) {
+			return fmt.Errorf("transit %q: egress_interface %q is not a valid interface name", t.Name, t.EgressInterface)
+		}
 		for _, tgt := range t.ProbeTargets {
 			if net.ParseIP(tgt) == nil {
 				return fmt.Errorf("transit %q: probe target %q is not an IP", t.Name, tgt)
 			}
+		}
+	}
+	// Defaults for per-transit optional tuning. Applied only after every transit
+	// has passed validation, so a rejected config is never partially mutated.
+	for i := range c.Transits {
+		if c.Transits[i].ProbeInterval == 0 {
+			c.Transits[i].ProbeInterval = c.ProbeIntervalDefault()
 		}
 	}
 	// Defaults for optional tuning.

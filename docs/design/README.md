@@ -12,5 +12,11 @@ ship the feature.
 | [`feature-3-visibility.md`](feature-3-visibility.md) | Global visibility monitor (DFZ view vs intended state) | [#8](https://github.com/ioseph-ai/transitd/issues/8) |
 | [`feature-4-tcp-probe.md`](feature-4-tcp-probe.md) | TCP-handshake probe mode (stateful-edge asymmetry) | [#6](https://github.com/ioseph-ai/transitd/issues/6) |
 
+Shared across the probe features:
+
+| Design | What it resolves | Tracking issue |
+|---|---|---|
+| [`pinning.md`](pinning.md) | Per-transit probe pinning (interface-pin vs source-pin) + startup verification preflight | [#1](https://github.com/ioseph-ai/transitd/issues/1) |
+
 All examples in these documents use RFC 5737/3849 documentation ranges and
 RFC 5398 documentation ASNs (64496–64511) only.

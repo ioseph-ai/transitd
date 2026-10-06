@@ -35,7 +35,7 @@ they cannot disagree:
     "pinning":  {"state": "degraded", "reason": "1 of 2 transits unverified at startup: their probes are suppressed (no samples, no decisions)"},
     "probes":   {"state": "degraded", "reason": "1 of 2 transits unverified at startup: their probes are suppressed (no samples, no decisions)"},
     "decisions": {"state": "enabled"},
-    "gossip":   {"state": "disabled", "reason": "gossip mesh not built into this binary (issue #3), but join is configured"}
+    "gossip":   {"state": "degraded", "reason": "gossip join not established: ..."}
   }
 }
 ```
@@ -78,8 +78,10 @@ sees it. "healthz field" is the JSON path in `/healthz`.
 | Probe binary present but not a recognised implementation | `features.probes.state = degraded` (+ `reason`) | `transitd_feature_state{feature="probes"} = 1` | WARN `feature not fully working` |
 | A transit's pin unverified (`ip route get` disagrees with `egress_interface`) | `pin_verified[transit] = false`; `features.pinning.state = degraded`; `features.probes.state = degraded` (+ `reason`, naming the count) | `transitd_pin_verified{transit} = 0`; `feature_state{feature="pinning"} = 1`; `feature_state{feature="probes"} = 1` | ERROR `pin NOT verified — transit suppressed: no probe samples, no decisions`, then WARN `feature not fully working` |
 | All transits unverified | `features.pinning.state = degraded`, `features.probes.state = degraded`; every `pin_verified` entry `false` | same as above, per transit | as above |
-| Gossip join configured but the mesh is not built into this binary | `features.gossip.state = disabled` (+ `reason`) | `transitd_feature_state{feature="gossip"} = 2` | WARN `feature not fully working` |
+| Gossip key configured but the mesh has not started yet | `features.gossip.state = degraded` (+ `reason`) | `transitd_feature_state{feature="gossip"} = 1` | WARN `feature not fully working` |
 | Gossip memberlist join failure (issue #3) | `features.gossip.state = degraded` (+ `reason`) | `transitd_feature_state{feature="gossip"} = 1` | WARN `feature not fully working` |
+| bgpwatch poller wired but no session observation arrived (vtysh not answering) | `features.bgpwatch.state = degraded` (+ `reason`) | `transitd_feature_state{feature="bgpwatch"} = 1` | WARN `feature not fully working` |
+| Control channel requested but not serving | `features.control.state = degraded` (+ `reason`) | `transitd_feature_state{feature="control"} = 1` | WARN `feature not fully working` |
 | Decision loop not running | `features.decisions.state = disabled` (+ `reason`) | `transitd_feature_state{feature="decisions"} = 2` | WARN `feature not fully working` |
 | Visibility provider down / rate-limited / schema drift (planned) | `features.visibility.state = degraded` (+ `reason`) | `transitd_feature_state{feature="visibility"} = 1` | WARN `feature not fully working` |
 
@@ -94,10 +96,13 @@ Notes:
   suppressed: the agent is observing a strict subset. The probes feature is
   *degraded*, not disabled — the verified transits still probe. A missing probe
   binary is the harder failure and is not overwritten by a pin outcome.
-- **Gossip** is listed twice on purpose. Once issue #3 lands, a failed memberlist
-  join becomes a `degraded` set with the join error as the reason; until then, a
-  config that names `join` hosts is reported `disabled`, because the operator has
-  clearly asked for a mesh that will never form.
+- **Gossip** is listed twice on purpose: a configured mesh is degraded from
+  construction until it starts, and a failed memberlist join keeps it degraded
+  with the join error as the reason — the operator has clearly asked for a mesh
+  that is not forming.
+- **bgpwatch** and **control** register only when the deployment asked for them
+  (bgpwatch enabled with a named neighbor; a control socket configured): a
+  capability the config did not request is absent, not broken.
 - **Visibility** rides this mechanism per issue #5's design-review note, and its
   metric (when it lands) is documented as page-worthy for a monitoring system.
 

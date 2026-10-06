@@ -20,8 +20,21 @@ func TestLoadExampleConfig(t *testing.T) {
 	if c.RouterName != "r-example" {
 		t.Errorf("router_name = %q, want r-example", c.RouterName)
 	}
-	if len(c.Join) != 1 || c.Join[0] != "192.0.2.11" {
-		t.Errorf("join = %v, want [192.0.2.11]", c.Join)
+	if len(c.Gossip.Join) != 1 || c.Gossip.Join[0] != "192.0.2.11" {
+		t.Errorf("gossip.join = %v, want [192.0.2.11]", c.Gossip.Join)
+	}
+	if !c.Gossip.Enabled() {
+		t.Error("gossip mesh is not enabled; the example config carries a key")
+	}
+	if c.Gossip.Port() != 7946 {
+		t.Errorf("gossip port = %d, want 7946", c.Gossip.Port())
+	}
+	key, err := c.Gossip.KeyBytes()
+	if err != nil {
+		t.Errorf("gossip.key did not decode: %v", err)
+	}
+	if len(key) != 32 {
+		t.Errorf("gossip.key decoded to %d bytes, want 32", len(key))
 	}
 	if c.ListenMetrics != ":9414" {
 		t.Errorf("listen_metrics = %q, want :9414", c.ListenMetrics)

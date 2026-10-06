@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "ts": "2026-01-01T00:00:00Z",
+  "router": "r-new",
+  "payload": {
+    "transits": [
+      {"name": "main", "session_up": true, "loss_pct": 0, "ewma_ms": 12.5},
+      {"name": "backup", "session_up": true, "loss_pct": 3.25}
+    ],
+    "decide": {"primary": "main", "switched": true, "reason": "initial adoption", "frozen": false}
+  }
+}

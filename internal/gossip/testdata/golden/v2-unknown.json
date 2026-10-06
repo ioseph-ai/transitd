@@ -1,0 +1,11 @@
+{
+  "schema_version": 2,
+  "ts": "2026-01-01T00:00:00Z",
+  "router": "r-future",
+  "payload": {
+    "transits": [
+      {"name": "main", "session_up": true, "loss_pct": 0, "ewma_ms": 1}
+    ],
+    "decide": {"primary": "main", "switched": true, "reason": "future schema"}
+  }
+}

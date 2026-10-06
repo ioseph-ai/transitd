@@ -19,13 +19,48 @@ import (
 
 	dto "github.com/prometheus/client_model/go"
 
+	"github.com/hashicorp/memberlist"
+
 	"github.com/ioseph-ai/transitd/internal/config"
 	"github.com/ioseph-ai/transitd/internal/decide"
+	"github.com/ioseph-ai/transitd/internal/gossip"
 	"github.com/ioseph-ai/transitd/internal/health"
 	"github.com/ioseph-ai/transitd/internal/metrics"
 	"github.com/ioseph-ai/transitd/internal/pinning"
 	"github.com/ioseph-ai/transitd/internal/probes"
 )
+
+// newTestMesh builds a mesh over an ephemeral loopback port, so an agent test can
+// exercise the real gossip wiring without binding the default mesh port. The
+// cadence is short so a test does not wait a production interval.
+func newTestMesh(t *testing.T, c *config.Config) *gossip.Mesh {
+	t.Helper()
+	ml := memberlist.DefaultLANConfig()
+	ml.Name = c.RouterName
+	ml.BindAddr = "127.0.0.1"
+	ml.BindPort = 0
+	ml.AdvertisePort = 0
+	key, err := c.Gossip.KeyBytes()
+	if err != nil {
+		t.Fatalf("gossip key: %v", err)
+	}
+	ml.SecretKey = key
+	ml.LogOutput = io.Discard
+	ml.ProbeInterval = 100 * time.Millisecond
+	ml.PushPullInterval = 100 * time.Millisecond
+	ml.GossipInterval = 50 * time.Millisecond
+	m, err := gossip.New(gossip.Options{
+		Config:           c,
+		Snapshot:         func() gossip.HealthPayload { return gossip.HealthPayload{} },
+		Interval:         50 * time.Millisecond,
+		Log:              discardingLog(),
+		MemberlistConfig: ml,
+	})
+	if err != nil {
+		t.Fatalf("gossip.New: %v", err)
+	}
+	return m
+}
 
 // --- fakes -------------------------------------------------------------------
 
@@ -438,23 +473,27 @@ func TestHealthzEndpoint(t *testing.T) {
 			t.Errorf("features[%s] is degraded but carries no reason", name)
 		}
 	}
-	// The gossip mesh is not built into this binary, so it is absent from the
-	// feature map unless the config asked for a join, in which case it is
-	// reported disabled with a reason. An unconfigured capability this build
-	// does not have must not appear as broken.
+	// The gossip mesh is configured by key, and a capability this deployment
+	// did not ask for is absent from the feature map: an unconfigured mesh must
+	// not appear as broken.
 	if _, ok := got.Features[featureGossip]; ok {
-		t.Errorf("features[gossip] = %+v present with no join configured, want absent", got.Features[featureGossip])
+		t.Errorf("features[gossip] = %+v present with no mesh configured, want absent", got.Features[featureGossip])
 	}
 }
 
-// TestConfiguredGossipJoinReportsDisabled covers the third wired consumer, and
-// the failure mode that has no error anywhere else: a deployment that configured
-// `join` is expecting a gossip mesh this binary does not provide. Nothing fails
-// at runtime — the agent just never joins — so the only place the operator can
-// find out is healthz.
-func TestConfiguredGossipJoinReportsDisabled(t *testing.T) {
+// TestConfiguredGossipReportsDegradedBeforeStart covers the third wired
+// consumer, and the failure mode that has no error anywhere else: a deployment
+// that configured a gossip key is expecting a mesh. Between construction and
+// Start nothing has joined — and if Start's mesh build fails the agent keeps
+// measuring — so the only place the operator can find out is healthz. The
+// feature is degraded (it has not had the chance to prove itself), not
+// disabled, and the status follows.
+func TestConfiguredGossipReportsDegradedBeforeStart(t *testing.T) {
 	c := testConfig(t, "gj-a")
-	c.Join = []string{"192.0.2.10:7946", "192.0.2.11:7946"}
+	c.Gossip.Key = "ZXhhbXBsZS1rZXktbm90LWEtc2VjcmV0LTMyYnl0ZXM="
+	if err := c.Validate(); err != nil {
+		t.Fatalf("fixture does not validate with a mesh key: %v", err)
+	}
 	a, err := New(Options{
 		Config: c, Verifier: &fakeVerifier{verified: map[string]bool{"gj-a": true}},
 		Runner: &scriptedRunner{}, Interval: 5 * time.Millisecond, Log: discardingLog(),
@@ -466,16 +505,16 @@ func TestConfiguredGossipJoinReportsDisabled(t *testing.T) {
 	h := a.Health()
 	f, ok := h.Features[featureGossip]
 	if !ok {
-		t.Fatalf("features[gossip] absent though join was configured: %+v", h.Features)
+		t.Fatalf("features[gossip] absent though a mesh key was configured: %+v", h.Features)
 	}
-	if f.State != health.Disabled {
-		t.Errorf("features[gossip].state = %q, want disabled", f.State)
+	if f.State != health.Degraded {
+		t.Errorf("features[gossip].state = %q, want degraded", f.State)
 	}
 	if f.Reason == "" {
-		t.Error("features[gossip] is disabled but carries no reason")
+		t.Error("features[gossip] is degraded but carries no reason")
 	}
 	if h.Status != health.StatusDegraded {
-		t.Errorf("status = %q, want degraded — a configured capability is not working", h.Status)
+		t.Errorf("status = %q, want degraded — a configured capability has not started", h.Status)
 	}
 }
 
@@ -624,6 +663,90 @@ func TestRunReturnsErrorFromStart(t *testing.T) {
 
 	if err := a.Run(context.Background()); err == nil {
 		t.Fatal("Run returned nil, want the Start error")
+	}
+}
+
+// --- health mesh (issue #3) --------------------------------------------------
+
+// TestHealthzOmitsGossipWhenUnconfigured checks the opt-in default surfaces
+// cleanly: a router with no mesh must not report a gossip object at all, so an
+// operator cannot mistake "not configured" for "configured and broken".
+func TestHealthzOmitsGossipWhenUnconfigured(t *testing.T) {
+	c := testConfig(t, "no-mesh")
+	a := newTestAgent(t, c, &fakeVerifier{verified: map[string]bool{"no-mesh": true}}, &scriptedRunner{})
+
+	h := a.Health()
+	if h.Gossip != nil {
+		t.Errorf("Health.Gossip = %+v, want nil for a router with no mesh", h.Gossip)
+	}
+	if _, ok := h.Features[featureGossip]; ok {
+		t.Errorf("features[gossip] = %+v present with no mesh configured, want absent", h.Features[featureGossip])
+	}
+}
+
+// TestAgentStartsMeshAndPublishesSnapshot is the wiring test behind the card's
+// "broadcasts a periodic HealthMsg containing the sender's per-transit probe
+// summary + decide view". It runs the agent's real Start against a real mesh (an
+// ephemeral loopback port) and asserts that the payload the mesh broadcasts is
+// built from the agent's own observations and decision state.
+func TestAgentStartsMeshAndPublishesSnapshot(t *testing.T) {
+	const name = "mesh-pub"
+	c := testConfig(t, name)
+	c.Gossip.Key = "ZXhhbXBsZS1rZXktbm90LWEtc2VjcmV0LTMyYnl0ZXM="
+	if err := c.Validate(); err != nil {
+		t.Fatalf("fixture does not validate with a mesh: %v", err)
+	}
+
+	a, err := New(Options{
+		Config:   c,
+		Verifier: &fakeVerifier{verified: map[string]bool{name: true}},
+		Runner:   &scriptedRunner{reply: true, rttMs: 21.5},
+		Interval: 5 * time.Millisecond,
+		Log:      discardingLog(),
+		Mesh:     newTestMesh(t, c),
+		OnPeer:   func(gossip.Message) {},
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	// Run, not Start: the decision loop's tick is what republishes the snapshot
+	// after samples arrive, so the loop has to be running for the payload to be
+	// current.
+	runErr := make(chan error, 1)
+	go func() { runErr <- a.Run(ctx) }()
+	waitFor(t, time.Second, func() bool { return a.probed.Load() })
+	waitFor(t, 2*time.Second, func() bool { return len(a.currentSnapshot().Transits) == 1 })
+
+	snap := a.currentSnapshot()
+	if snap.Transits[0].Name != name {
+		t.Fatalf("snapshot transit = %q, want %q", snap.Transits[0].Name, name)
+	}
+	if snap.Transits[0].EwmaMs == nil || *snap.Transits[0].EwmaMs != 21.5 {
+		t.Errorf("snapshot ewma = %v, want 21.5", snap.Transits[0].EwmaMs)
+	}
+
+	// The healthz surface must now report the mesh as configured and joined.
+	h := a.Health()
+	if h.Gossip == nil {
+		t.Fatal("Health.Gossip = nil while a mesh is running")
+	}
+	if !h.Gossip.Enabled || !h.Gossip.Joined {
+		t.Errorf("gossip health = %+v, want enabled and joined (single-node mesh)", h.Gossip)
+	}
+	f, ok := h.Features[featureGossip]
+	if !ok || f.State != health.Enabled {
+		t.Errorf("features[gossip] = %+v (ok=%v), want state enabled after join", h.Features[featureGossip], ok)
+	}
+
+	// Cancel first, then wait: Run's ctx-cancel path is what shuts the mesh down,
+	// and leaving a mesh listening past the test would leak a port into the next
+	// test in the package.
+	cancel()
+	if err := <-runErr; err != nil {
+		t.Fatalf("Run: %v", err)
 	}
 }
 

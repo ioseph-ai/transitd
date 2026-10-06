@@ -1,0 +1,2 @@
+go test fuzz v1
+[]byte("{\"schema_version\":1,\"ts\":\"2026-01-01T00:00:00Z\",\"router\":\"r-x\",\"payload\":null}")

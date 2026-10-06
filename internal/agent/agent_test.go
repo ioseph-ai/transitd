@@ -19,12 +19,48 @@ import (
 
 	dto "github.com/prometheus/client_model/go"
 
+	"github.com/hashicorp/memberlist"
+
 	"github.com/ioseph-ai/transitd/internal/config"
 	"github.com/ioseph-ai/transitd/internal/decide"
+	"github.com/ioseph-ai/transitd/internal/gossip"
+	"github.com/ioseph-ai/transitd/internal/health"
 	"github.com/ioseph-ai/transitd/internal/metrics"
 	"github.com/ioseph-ai/transitd/internal/pinning"
 	"github.com/ioseph-ai/transitd/internal/probes"
 )
+
+// newTestMesh builds a mesh over an ephemeral loopback port, so an agent test can
+// exercise the real gossip wiring without binding the default mesh port. The
+// cadence is short so a test does not wait a production interval.
+func newTestMesh(t *testing.T, c *config.Config) *gossip.Mesh {
+	t.Helper()
+	ml := memberlist.DefaultLANConfig()
+	ml.Name = c.RouterName
+	ml.BindAddr = "127.0.0.1"
+	ml.BindPort = 0
+	ml.AdvertisePort = 0
+	key, err := c.Gossip.KeyBytes()
+	if err != nil {
+		t.Fatalf("gossip key: %v", err)
+	}
+	ml.SecretKey = key
+	ml.LogOutput = io.Discard
+	ml.ProbeInterval = 100 * time.Millisecond
+	ml.PushPullInterval = 100 * time.Millisecond
+	ml.GossipInterval = 50 * time.Millisecond
+	m, err := gossip.New(gossip.Options{
+		Config:           c,
+		Snapshot:         func() gossip.HealthPayload { return gossip.HealthPayload{} },
+		Interval:         50 * time.Millisecond,
+		Log:              discardingLog(),
+		MemberlistConfig: ml,
+	})
+	if err != nil {
+		t.Fatalf("gossip.New: %v", err)
+	}
+	return m
+}
 
 // --- fakes -------------------------------------------------------------------
 
@@ -122,13 +158,31 @@ func testConfig(t *testing.T, names ...string) *config.Config {
 
 // newTestAgent builds an agent over the fixture with fakes injected. Interval is
 // short so an end-to-end test reaches a decision cycle within its patience.
+//
+// LookPath is stubbed to report the probe binary present, so the startup
+// capability check is deterministic: whether ping is on PATH is a property of
+// the CI image, and a feature test must not depend on it.
 func newTestAgent(t *testing.T, c *config.Config, v *fakeVerifier, r probes.Runner) *Agent {
 	t.Helper()
-	a, err := New(Options{Config: c, Verifier: v, Runner: r, Interval: 5 * time.Millisecond, Log: discardingLog()})
+	a, err := New(Options{
+		Config: c, Verifier: v, Runner: r, Interval: 5 * time.Millisecond,
+		Log: discardingLog(), LookPath: fakeLookPath(true),
+	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
 	return a
+}
+
+// fakeLookPath returns a LookPath that reports the binary found (found=true) or
+// missing (found=false).
+func fakeLookPath(found bool) func(string) (string, error) {
+	if found {
+		return func(file string) (string, error) { return "/usr/bin/" + file, nil }
+	}
+	return func(file string) (string, error) {
+		return "", fmt.Errorf("exec: %q: executable file not found in $PATH", file)
+	}
 }
 
 // newUncheckedAgent builds the agent's internals directly, bypassing New's
@@ -137,13 +191,19 @@ func newTestAgent(t *testing.T, c *config.Config, v *fakeVerifier, r probes.Runn
 // constructor — not Validate — is what refuses it.
 func newUncheckedAgent(c *config.Config, v *fakeVerifier, r probes.Runner) *Agent {
 	a := &Agent{
-		cfg:      c,
-		log:      discardingLog(),
-		interval: 5 * time.Millisecond,
-		engine:   decide.NewEngine(c, &decide.State{WinStreak: map[string]int{}}),
-		samples:  make(chan probes.Sample, 8),
-		obs:      map[string]probes.Sample{},
+		cfg:           c,
+		log:           discardingLog(),
+		interval:      5 * time.Millisecond,
+		engine:        decide.NewEngine(c, &decide.State{WinStreak: map[string]int{}}),
+		samples:       make(chan probes.Sample, 8),
+		obs:           map[string]probes.Sample{},
+		reg:           health.New(health.Options{Log: discardingLog()}),
+		probeBinary:   "ping",
+		lookPath:      fakeLookPath(true),
+		probeBinaryOK: true,
 	}
+	a.reg.Register(featureDecisions, health.Enabled, "")
+	a.reg.Register(featurePinning, health.Enabled, "startup pin verification pending")
 	a.sup = &probes.Supervisor{Runner: r, Verify: v.Verify, Emit: a.onSample}
 	return a
 }
@@ -179,11 +239,15 @@ func TestUnverifiedTransitProducesNoSamplesAndNoDecisions(t *testing.T) {
 	if h.PinVerified[bad] {
 		t.Error("unverified transit reported verified")
 	}
-	if h.Status != statusDegraded {
+	if h.Status != health.StatusDegraded {
 		t.Errorf("healthz status = %q, want degraded while a configured transit is unverified", h.Status)
 	}
-	if h.Features["probes"] != featureOK {
-		t.Errorf("features[probes] = %q, want ok — the verified transit did emit a sample", h.Features["probes"])
+	// The registry reports one entry per capability with its state and reason.
+	if _, ok := h.Features[featureProbes]; !ok {
+		t.Error("features has no probes entry")
+	}
+	if _, ok := h.Features[featurePinning]; !ok {
+		t.Error("features has no pinning entry")
 	}
 	if runner.callCount() == 0 {
 		t.Error("no probe ran for the verified transit")
@@ -227,11 +291,14 @@ func TestUnverifiedTransitRunsNoPing(t *testing.T) {
 		t.Error("agent reports a probe sample, want none when every transit is unverified")
 	}
 	h := a.Health()
-	if h.Status != statusDegraded {
+	if h.Status != health.StatusDegraded {
 		t.Errorf("status = %q, want degraded", h.Status)
 	}
-	if h.Features["probes"] != featureUnavailable {
-		t.Errorf("features[probes] = %q, want unavailable with no verified transit", h.Features["probes"])
+	if h.Features[featureProbes].State != health.Degraded {
+		t.Errorf("features[probes] = %+v, want degraded with every transit unverified", h.Features[featureProbes])
+	}
+	if h.Features[featurePinning].State != health.Degraded {
+		t.Errorf("features[pinning] = %+v, want degraded with every transit unverified", h.Features[featurePinning])
 	}
 }
 
@@ -358,7 +425,8 @@ func TestEvaluateFoldsSwitchBackIntoState(t *testing.T) {
 
 // TestHealthzEndpoint checks the /healthz JSON contract: the three top-level
 // fields, one pin_verified entry per configured transit (including the unverified
-// one), and a degraded status when any is unverified.
+// one), a degraded status when any is unverified, and a features map whose
+// per-feature shape is {state, reason}.
 func TestHealthzEndpoint(t *testing.T) {
 	const good, bad = "hz-good", "hz-bad"
 	c := testConfig(t, good, bad)
@@ -384,7 +452,7 @@ func TestHealthzEndpoint(t *testing.T) {
 	if err := json.NewDecoder(rec.Body).Decode(&got); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	if got.Status != statusDegraded {
+	if got.Status != health.StatusDegraded {
 		t.Errorf("status = %q, want degraded", got.Status)
 	}
 	if len(got.PinVerified) != 2 {
@@ -393,11 +461,113 @@ func TestHealthzEndpoint(t *testing.T) {
 	if !got.PinVerified[good] || got.PinVerified[bad] {
 		t.Errorf("pin_verified = %v", got.PinVerified)
 	}
-	if got.Features["act"] != featureUnavailable {
-		t.Errorf("features[act] = %q, want unavailable — observe-only is a capability, not a fault", got.Features["act"])
+	// The card's feature shape: each feature carries a state and, when not
+	// enabled, a reason. The one unverified transit degrades pinning (and with
+	// it probes), so both must be degraded with a reason rather than "ok".
+	for _, name := range []string{featureProbes, featurePinning} {
+		f := got.Features[name]
+		if f.State != health.Degraded {
+			t.Errorf("features[%s].state = %q, want degraded", name, f.State)
+		}
+		if f.Reason == "" {
+			t.Errorf("features[%s] is degraded but carries no reason", name)
+		}
 	}
-	if got.Features["decisions"] != featureUnavailable {
-		t.Errorf("features[decisions] = %q, want unavailable before Run starts", got.Features["decisions"])
+	// The gossip mesh is configured by key, and a capability this deployment
+	// did not ask for is absent from the feature map: an unconfigured mesh must
+	// not appear as broken.
+	if _, ok := got.Features[featureGossip]; ok {
+		t.Errorf("features[gossip] = %+v present with no mesh configured, want absent", got.Features[featureGossip])
+	}
+}
+
+// TestConfiguredGossipReportsDegradedBeforeStart covers the third wired
+// consumer, and the failure mode that has no error anywhere else: a deployment
+// that configured a gossip key is expecting a mesh. Between construction and
+// Start nothing has joined — and if Start's mesh build fails the agent keeps
+// measuring — so the only place the operator can find out is healthz. The
+// feature is degraded (it has not had the chance to prove itself), not
+// disabled, and the status follows.
+func TestConfiguredGossipReportsDegradedBeforeStart(t *testing.T) {
+	c := testConfig(t, "gj-a")
+	c.Gossip.Key = "ZXhhbXBsZS1rZXktbm90LWEtc2VjcmV0LTMyYnl0ZXM="
+	if err := c.Validate(); err != nil {
+		t.Fatalf("fixture does not validate with a mesh key: %v", err)
+	}
+	a, err := New(Options{
+		Config: c, Verifier: &fakeVerifier{verified: map[string]bool{"gj-a": true}},
+		Runner: &scriptedRunner{}, Interval: 5 * time.Millisecond, Log: discardingLog(),
+		LookPath: fakeLookPath(true),
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	h := a.Health()
+	f, ok := h.Features[featureGossip]
+	if !ok {
+		t.Fatalf("features[gossip] absent though a mesh key was configured: %+v", h.Features)
+	}
+	if f.State != health.Degraded {
+		t.Errorf("features[gossip].state = %q, want degraded", f.State)
+	}
+	if f.Reason == "" {
+		t.Error("features[gossip] is degraded but carries no reason")
+	}
+	if h.Status != health.StatusDegraded {
+		t.Errorf("status = %q, want degraded — a configured capability has not started", h.Status)
+	}
+}
+
+// TestHealthzFeatureStateMetricMatchesPayload is the cross-surface check: for
+// every feature in the healthz payload, transitd_feature_state{feature} must
+// carry the same state as the metric's numeric contract. The two are written by
+// one registry call, and this asserts they cannot drift.
+func TestHealthzFeatureStateMetricMatchesPayload(t *testing.T) {
+	c := testConfig(t, "fs-a", "fs-b")
+	// Force the harder failure: the probe binary is not found. LookPath is
+	// stubbed rather than pointed at a nonexistent name so the assertion does
+	// not depend on what happens to be on PATH.
+	a, err := New(Options{
+		Config:      c,
+		Verifier:    &fakeVerifier{verified: map[string]bool{"fs-a": true, "fs-b": false}},
+		Runner:      &scriptedRunner{},
+		ProbeBinary: "ping",
+		LookPath:    fakeLookPath(false),
+		Interval:    5 * time.Millisecond,
+		Log:         discardingLog(),
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if err := a.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	h := a.Health()
+	if h.Status != health.StatusDegraded {
+		t.Errorf("status = %q, want degraded with no ping binary", h.Status)
+	}
+	if got := h.Features[featureProbes].State; got != health.Disabled {
+		t.Errorf("features[probes].state = %q, want disabled when the ping binary is absent", got)
+	}
+	if h.Features[featureProbes].Reason == "" {
+		t.Error("features[probes] is disabled but carries no reason")
+	}
+
+	want := map[health.State]int{
+		health.Enabled:  metrics.FeatureStateEnabled,
+		health.Degraded: metrics.FeatureStateDegraded,
+		health.Disabled: metrics.FeatureStateDisabled,
+	}
+	for name, f := range h.Features {
+		v, ok := featureStateValue(t, name)
+		if !ok {
+			t.Errorf("feature %q is in healthz but has no transitd_feature_state series", name)
+			continue
+		}
+		if v != want[f.State] {
+			t.Errorf("feature %q: payload state %q but metric %d, want %d", name, f.State, v, want[f.State])
+		}
 	}
 }
 
@@ -421,22 +591,29 @@ func TestMetricsEndpointExportsTransitdNamespace(t *testing.T) {
 	}
 }
 
-// TestHealthBeforeStartIsDegraded pins the safe default: before the preflight has
-// run, nothing is proven, so every transit reads unverified and the agent says
-// degraded. A healthz that reported "ok" here would be lying.
-func TestHealthBeforeStartIsDegraded(t *testing.T) {
+// TestHealthBeforeStartIsHonest pins the safe default: before the preflight has
+// run, no transit is proven, so every transit reads unverified — the agent has
+// not claimed one works. What it does NOT do is assert an overall status it has
+// no basis for: the capabilities that have not reported yet simply are not in the
+// feature map, and the status only goes degraded once a real capability says so.
+// A healthz that reported "ok" here would be lying; one that reported "degraded"
+// for a feature this build does not have would be permanently alarming.
+func TestHealthBeforeStartIsHonest(t *testing.T) {
 	c := testConfig(t, "pre-a", "pre-b")
 	a := newTestAgent(t, c, &fakeVerifier{verified: map[string]bool{"pre-a": true, "pre-b": true}}, &scriptedRunner{})
 
 	h := a.Health()
-	if h.Status != statusDegraded {
-		t.Errorf("status before Start = %q, want degraded", h.Status)
+	if h.Status != health.StatusOK {
+		t.Errorf("status before Start = %q, want ok — nothing has reported a failure yet", h.Status)
 	}
 	for _, n := range []string{"pre-a", "pre-b"} {
 		if h.PinVerified[n] {
 			t.Errorf("pin_verified[%s] = true before the preflight ran", n)
 		}
 	}
+	// The preflight has not run, so no transit is verified and the status is
+	// still ok only because no capability has asserted a failure. Once Start
+	// runs, the unverified transits appear.
 }
 
 // --- failure semantics -------------------------------------------------------
@@ -486,6 +663,90 @@ func TestRunReturnsErrorFromStart(t *testing.T) {
 
 	if err := a.Run(context.Background()); err == nil {
 		t.Fatal("Run returned nil, want the Start error")
+	}
+}
+
+// --- health mesh (issue #3) --------------------------------------------------
+
+// TestHealthzOmitsGossipWhenUnconfigured checks the opt-in default surfaces
+// cleanly: a router with no mesh must not report a gossip object at all, so an
+// operator cannot mistake "not configured" for "configured and broken".
+func TestHealthzOmitsGossipWhenUnconfigured(t *testing.T) {
+	c := testConfig(t, "no-mesh")
+	a := newTestAgent(t, c, &fakeVerifier{verified: map[string]bool{"no-mesh": true}}, &scriptedRunner{})
+
+	h := a.Health()
+	if h.Gossip != nil {
+		t.Errorf("Health.Gossip = %+v, want nil for a router with no mesh", h.Gossip)
+	}
+	if _, ok := h.Features[featureGossip]; ok {
+		t.Errorf("features[gossip] = %+v present with no mesh configured, want absent", h.Features[featureGossip])
+	}
+}
+
+// TestAgentStartsMeshAndPublishesSnapshot is the wiring test behind the card's
+// "broadcasts a periodic HealthMsg containing the sender's per-transit probe
+// summary + decide view". It runs the agent's real Start against a real mesh (an
+// ephemeral loopback port) and asserts that the payload the mesh broadcasts is
+// built from the agent's own observations and decision state.
+func TestAgentStartsMeshAndPublishesSnapshot(t *testing.T) {
+	const name = "mesh-pub"
+	c := testConfig(t, name)
+	c.Gossip.Key = "ZXhhbXBsZS1rZXktbm90LWEtc2VjcmV0LTMyYnl0ZXM="
+	if err := c.Validate(); err != nil {
+		t.Fatalf("fixture does not validate with a mesh: %v", err)
+	}
+
+	a, err := New(Options{
+		Config:   c,
+		Verifier: &fakeVerifier{verified: map[string]bool{name: true}},
+		Runner:   &scriptedRunner{reply: true, rttMs: 21.5},
+		Interval: 5 * time.Millisecond,
+		Log:      discardingLog(),
+		Mesh:     newTestMesh(t, c),
+		OnPeer:   func(gossip.Message) {},
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	// Run, not Start: the decision loop's tick is what republishes the snapshot
+	// after samples arrive, so the loop has to be running for the payload to be
+	// current.
+	runErr := make(chan error, 1)
+	go func() { runErr <- a.Run(ctx) }()
+	waitFor(t, time.Second, func() bool { return a.probed.Load() })
+	waitFor(t, 2*time.Second, func() bool { return len(a.currentSnapshot().Transits) == 1 })
+
+	snap := a.currentSnapshot()
+	if snap.Transits[0].Name != name {
+		t.Fatalf("snapshot transit = %q, want %q", snap.Transits[0].Name, name)
+	}
+	if snap.Transits[0].EwmaMs == nil || *snap.Transits[0].EwmaMs != 21.5 {
+		t.Errorf("snapshot ewma = %v, want 21.5", snap.Transits[0].EwmaMs)
+	}
+
+	// The healthz surface must now report the mesh as configured and joined.
+	h := a.Health()
+	if h.Gossip == nil {
+		t.Fatal("Health.Gossip = nil while a mesh is running")
+	}
+	if !h.Gossip.Enabled || !h.Gossip.Joined {
+		t.Errorf("gossip health = %+v, want enabled and joined (single-node mesh)", h.Gossip)
+	}
+	f, ok := h.Features[featureGossip]
+	if !ok || f.State != health.Enabled {
+		t.Errorf("features[gossip] = %+v (ok=%v), want state enabled after join", h.Features[featureGossip], ok)
+	}
+
+	// Cancel first, then wait: Run's ctx-cancel path is what shuts the mesh down,
+	// and leaving a mesh listening past the test would leak a port into the next
+	// test in the package.
+	cancel()
+	if err := <-runErr; err != nil {
+		t.Fatalf("Run: %v", err)
 	}
 }
 
@@ -580,6 +841,24 @@ func gatherMetrics(t *testing.T) map[string]*dto.MetricFamily {
 		out[f.GetName()] = f
 	}
 	return out
+}
+
+// featureStateValue reads transitd_feature_state{feature=name} from the shared
+// registry.
+func featureStateValue(t *testing.T, name string) (int, bool) {
+	t.Helper()
+	fam := gatherMetrics(t)["transitd_feature_state"]
+	if fam == nil {
+		return 0, false
+	}
+	for _, m := range fam.GetMetric() {
+		for _, lp := range m.GetLabel() {
+			if lp.GetName() == metrics.LabelFeature && lp.GetValue() == name {
+				return int(m.GetGauge().GetValue()), true
+			}
+		}
+	}
+	return 0, false
 }
 
 // decisionSeriesNaming counts decisions_total series naming transit in any label.

@@ -10,6 +10,7 @@ import (
 	"github.com/ioseph-ai/transitd/internal/bgpwatch"
 	"github.com/ioseph-ai/transitd/internal/config"
 	"github.com/ioseph-ai/transitd/internal/decide"
+	"github.com/ioseph-ai/transitd/internal/health"
 	"github.com/ioseph-ai/transitd/internal/probes"
 )
 
@@ -233,16 +234,17 @@ func TestBGPWatchRunsReadOnlyPolls(t *testing.T) {
 		}
 	}
 	// The observation must be visible to healthz: bgpwatch is a live capability.
-	if got := a.Health().Features["bgpwatch"]; got != featureOK {
-		t.Errorf("features[bgpwatch] = %q, want ok once a session observation arrived", got)
+	f, ok := a.Health().Features[featureBgpwatch]
+	if !ok || f.State != health.Enabled {
+		t.Errorf("features[bgpwatch] = %+v (ok=%v), want state enabled once a session observation arrived", f, ok)
 	}
 }
 
-// TestBGPWatchFeatureIsUnavailableWithoutObservation pins the healthz half: with
-// the poller wired but nothing observed yet, bgpwatch reads "unavailable", so an
-// operator can tell "not answering" from "not enabled" — the same discipline the
-// probes feature follows.
-func TestBGPWatchFeatureIsUnavailableWithoutObservation(t *testing.T) {
+// TestBGPWatchFeatureIsDegradedWithoutObservation pins the healthz half: with
+// the poller wired but nothing observed yet, bgpwatch reads degraded with a
+// reason, so an operator can tell "not answering" from "not enabled" — the same
+// discipline the probes feature follows.
+func TestBGPWatchFeatureIsDegradedWithoutObservation(t *testing.T) {
 	c := bgpTestConfig(t, "bgp-hz")
 	a, err := New(Options{
 		Config:   c,
@@ -255,8 +257,15 @@ func TestBGPWatchFeatureIsUnavailableWithoutObservation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	if got := a.Health().Features["bgpwatch"]; got != featureUnavailable {
-		t.Errorf("features[bgpwatch] = %q before any observation, want unavailable", got)
+	f, ok := a.Health().Features[featureBgpwatch]
+	if !ok {
+		t.Fatalf("features[bgpwatch] absent though the poller is wired: %+v", a.Health().Features)
+	}
+	if f.State != health.Degraded {
+		t.Errorf("features[bgpwatch] = %+v before any observation, want degraded", f)
+	}
+	if f.Reason == "" {
+		t.Error("features[bgpwatch] is degraded but carries no reason")
 	}
 }
 

@@ -2,6 +2,7 @@
 package config
 
 import (
+	"encoding/base64"
 	"fmt"
 	"net"
 	"regexp"
@@ -62,15 +63,108 @@ type BGPWatchConfig struct {
 	Interval time.Duration `yaml:"interval"`
 }
 
+// Gossip configures the memberlist health mesh (issue #3). The mesh is assumed
+// to run on a trusted transport (wireguard or an IXP/LAN under the operator's
+// control); the key authenticates and encrypts it but is not a privilege
+// boundary — anyone holding it can inject health state, so it is treated like
+// an SSH key.
+//
+// The block is opt-in: an empty Key disables the mesh entirely, which is the
+// right default for a single-router deployment and lets the unit tier run
+// without opening a socket. Because the block is opt-in, `join` without a `key`
+// is a configuration error rather than a silent no-op: an operator who wrote a
+// peer list meant to have a mesh.
+type Gossip struct {
+	// Key is the shared mesh secret, base64, decoded to a 16, 24 or 32 byte
+	// AES key (the lengths memberlist accepts). Empty disables the mesh.
+	Key string `yaml:"key"`
+
+	// BindPort is the mesh UDP+TCP port. Zero means the default, 7946. Zero is
+	// also what tests use to mean "any free port", which is why a literal 0 is
+	// not rejected here — Validate only refuses an explicitly impossible port.
+	BindPort int `yaml:"bind_port"`
+
+	// Join lists peers to contact at startup, each "host" or "host:port". A
+	// failed join is not fatal: the mesh keeps retrying and reports the state
+	// through healthz, because a router that cannot reach its peers must still
+	// measure and act on its own transits.
+	Join []string `yaml:"join"`
+}
+
+// GossipBindPortDefault is the memberlist default mesh port.
+const GossipBindPortDefault = 7946
+
+// Enabled reports whether the operator configured a mesh. An empty key means no
+// mesh: the agent then runs with no peers rather than joining with a zero key
+// (which memberlist would treat as no encryption at all).
+func (g *Gossip) Enabled() bool { return strings.TrimSpace(g.Key) != "" }
+
+// KeyBytes decodes the configured shared key and checks it against the lengths
+// memberlist's AES cipher accepts. It is the one place the key is decoded, so
+// every consumer (the mesh, and the control channel that reuses the key for
+// local authentication) sees the same validation.
+func (g *Gossip) KeyBytes() ([]byte, error) {
+	if !g.Enabled() {
+		return nil, nil
+	}
+	k, err := base64.StdEncoding.DecodeString(strings.TrimSpace(g.Key))
+	if err != nil {
+		return nil, fmt.Errorf("gossip.key is not valid base64: %w", err)
+	}
+	switch len(k) {
+	case 16, 24, 32:
+		return k, nil
+	default:
+		return nil, fmt.Errorf("gossip.key decodes to %d bytes; memberlist accepts a 16, 24 or 32 byte key", len(k))
+	}
+}
+
+// Port returns the effective mesh port with the default applied.
+func (g *Gossip) Port() int {
+	if g.BindPort == 0 {
+		return GossipBindPortDefault
+	}
+	return g.BindPort
+}
+
+// validate checks the mesh block's structural invariants. The mesh is opt-in,
+// so an empty block is valid and means "no mesh"; every other check only applies
+// once a key is present.
+func (g *Gossip) validate() error {
+	if !g.Enabled() {
+		// A join list without a key is a half-configured mesh: the operator
+		// wrote peers expecting to join them, and a silent no-op would leave
+		// the agent alone on the network with no error to explain it.
+		if len(g.Join) > 0 {
+			return fmt.Errorf("gossip.join is set but gossip.key is empty — set the shared mesh key, or remove the peer list to run with no mesh")
+		}
+		return nil
+	}
+	if _, err := g.KeyBytes(); err != nil {
+		return err
+	}
+	if g.BindPort < 0 || g.BindPort > 65535 {
+		return fmt.Errorf("gossip.bind_port %d is not a valid port", g.BindPort)
+	}
+	for i, peer := range g.Join {
+		if strings.TrimSpace(peer) == "" {
+			return fmt.Errorf("gossip.join[%d] is empty", i)
+		}
+	}
+	return nil
+}
+
 // Config is the full agent configuration.
 type Config struct {
 	RouterName string `yaml:"router_name"`
 
-	// Gossip mesh (memberlist). BindAddr is typically the router's mesh
-	// interface address; Key is the 32-byte shared secret (base64).
-	BindAddr string   `yaml:"bind_addr"`
-	Join     []string `yaml:"join"`
-	KeyB64   string   `yaml:"key_b64"`
+	// BindAddr is the router's mesh interface address: the local address the
+	// memberlist transport binds and advertises. It stays top-level because it
+	// is a per-host fact (like router_name), not a mesh protocol setting.
+	BindAddr string `yaml:"bind_addr"`
+
+	// Gossip groups the mesh protocol settings.
+	Gossip Gossip `yaml:"gossip"`
 
 	// Decision tuning.
 	BaseLP      int           `yaml:"base_lp"`               // LP for rank 1 (default 200)
@@ -121,6 +215,9 @@ func (c *Config) Validate() error {
 	}
 	if ip := net.ParseIP(c.BindAddr); ip == nil {
 		return fmt.Errorf("bind_addr %q is not an IP", c.BindAddr)
+	}
+	if err := c.Gossip.validate(); err != nil {
+		return err
 	}
 	if len(c.Transits) < 1 {
 		return fmt.Errorf("at least one transit is required")

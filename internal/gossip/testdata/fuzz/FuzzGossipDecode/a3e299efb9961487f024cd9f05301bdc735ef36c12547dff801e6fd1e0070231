@@ -1,0 +1,2 @@
+go test fuzz v1
+[]byte("{\"schema_version\":1,\"ts\":\"2026-01-01T00:00:00Z\",\"router\":\"r-a\",\"payload\":{\"transits\":[{\"name\":\"main\",\"session_up\":true,\"loss_pct\":0,\"ewma_ms\":12.5}],\"decide\":{\"primary\":\"main\",\"switched\":true,\"reason\":\"initial adoption\"}}}")

@@ -45,6 +45,30 @@ const (
 	LabelResult = "result"
 )
 
+// LabelFeature is the label on the feature-state gauge: the capability's name
+// as registered in internal/health (issue #5). It is deliberately not a fixed
+// enum here — the registry is generic and a new subsystem adds a feature
+// without this package changing.
+const LabelFeature = "feature"
+
+// Feature-state gauge values, per issue #5's contract.
+const (
+	// FeatureStateEnabled is 0: the capability is working.
+	FeatureStateEnabled = 0
+	// FeatureStateDegraded is 1: the capability is impaired but still running.
+	FeatureStateDegraded = 1
+	// FeatureStateDisabled is 2: the capability has turned itself off.
+	FeatureStateDisabled = 2
+)
+
+// LabelSchemaVersion labels the schema-version receive counter. Its value is the
+// schema_version of the gossiped envelope, as a decimal string. It is a label
+// rather than a per-version metric family because the point an operator reads is
+// "which versions are still on the wire", and a single series with one label
+// answers it directly — including for versions this build does not know, which
+// is exactly the rollout signal the append-only schema exists to make visible.
+const LabelSchemaVersion = "version"
+
 // Registry is the collector registry transitd exports. It is separate from
 // prometheus.DefaultRegisterer so tests can construct an isolated registry and
 // so the agent can add Go/process collectors explicitly rather than inheriting
@@ -109,6 +133,57 @@ var (
 		Name:      "act_ops",
 		Help:      "vtysh mutation batches issued, by op (apply/rollback) and result (applied/skipped/error).",
 	}, []string{LabelOp, LabelResult})
+
+	// FeatureState is the current state of every registered feature (issue #5),
+	// keyed by feature name: 0 enabled, 1 degraded, 2 disabled. It is a gauge,
+	// not a counter, because the question an operator asks is "what is broken
+	// right now", and because a feature can return to enabled. The registry in
+	// internal/health is the writer; this is the operator-side surface of the
+	// same fact the healthz payload reports.
+	FeatureState = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: namespace,
+		Name:      "feature_state",
+		Help:      "State of a feature capability: 0=enabled, 1=degraded, 2=disabled. Reason is on the healthz payload and the log line.",
+	}, []string{LabelFeature})
+
+	// GossipMembers is the number of alive nodes in the gossip mesh, including
+	// this router. A value of 1 is a healthy single-agent mesh, not an error;
+	// the mesh growing past 1 is what makes the merged health view useful, and
+	// the number falling back to 1 is the partition signal an operator watches.
+	GossipMembers = prometheus.NewGauge(prometheus.GaugeOpts{
+		Namespace: namespace,
+		Name:      "gossip_members",
+		Help:      "Number of alive nodes in the gossip mesh, including this router.",
+	})
+
+	// GossipRx counts every message that reaches the delegate's receive path,
+	// including frames that fail to decode. It is incremented before Decode so a
+	// peer streaming garbage is visible as rx traffic rather than silently
+	// disappearing; the per-version counter below is what breaks the rate down by
+	// schema, and only increments once the envelope decoded.
+	GossipRx = prometheus.NewCounter(prometheus.CounterOpts{ //nolint:promlinter // name fixed by issue #3's metric contract
+		Namespace: namespace,
+		Name:      "gossip_rx",
+		Help:      "Gossip messages received from the mesh, including frames that failed to decode.",
+	})
+
+	// GossipTx counts gossip health messages this router broadcast onto the mesh.
+	GossipTx = prometheus.NewCounter(prometheus.CounterOpts{ //nolint:promlinter // name fixed by issue #3's metric contract
+		Namespace: namespace,
+		Name:      "gossip_tx",
+		Help:      "Gossip health messages broadcast by this router.",
+	})
+
+	// GossipSchemaRx counts received health messages by the schema_version of
+	// their envelope. A series for a version this build does not know is the
+	// rollout signal the append-only policy is built around: it proves a newer
+	// peer is on the wire and that this node is ignoring, not erroring on, its
+	// unknown fields.
+	GossipSchemaRx = prometheus.NewCounterVec(prometheus.CounterOpts{ //nolint:promlinter // name fixed by issue #3's metric contract
+		Namespace: namespace,
+		Name:      "gossip_schema_rx",
+		Help:      "Gossip health messages received, by envelope schema_version.",
+	}, []string{LabelSchemaVersion})
 )
 
 // Act op and result values. They are the label vocabularies for ActOps and are
@@ -137,7 +212,10 @@ var registerOnce sync.Once
 func Register() error {
 	var err error
 	registerOnce.Do(func() {
-		for _, c := range []prometheus.Collector{PinVerified, ProbeLatencyMs, ProbeLossPct, DecisionsTotal, ActOps} {
+		for _, c := range []prometheus.Collector{
+			PinVerified, ProbeLatencyMs, ProbeLossPct, DecisionsTotal, ActOps, FeatureState,
+			GossipMembers, GossipRx, GossipTx, GossipSchemaRx,
+		} {
 			rerr := Registry.Register(c)
 			if rerr == nil {
 				continue
@@ -182,4 +260,13 @@ func SetProbeLossOnly(transit string, lossPct float64) {
 func ClearProbe(transit string) {
 	ProbeLatencyMs.DeleteLabelValues(transit)
 	ProbeLossPct.DeleteLabelValues(transit)
+}
+
+// SetFeatureState exports one feature capability's current state as
+// transitd_feature_state{feature}. state is the numeric contract from issue #5
+// (FeatureStateEnabled/Degraded/Disabled). The registry in internal/health is
+// the only caller: keeping the write behind one setter means the gauge can
+// never disagree with the healthz payload about what a feature is doing.
+func SetFeatureState(feature string, state int) {
+	FeatureState.WithLabelValues(feature).Set(float64(state))
 }

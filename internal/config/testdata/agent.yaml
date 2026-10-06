@@ -2,12 +2,25 @@
 # documentation range; no deployment values appear here.
 router_name: r-example
 
-# Gossip mesh endpoint (memberlist). The mesh itself is assumed trusted
-# (wireguard); the key is treated like an SSH key.
+# Gossip health mesh (memberlist). The mesh is assumed to run on a trusted
+# transport (wireguard or an operator-controlled LAN); the key is treated like
+# an SSH key because anyone holding it can inject health state.
+#
+# The whole block is opt-in: leave `key` empty to run with no mesh at all, which
+# is the right default for a single-router deployment. Setting `join` without a
+# `key` is a startup error rather than a silent no-op.
+#
+# bind_addr is the router's mesh interface address; it stays top-level because it
+# is a per-host fact, like router_name.
 bind_addr: 192.0.2.10
-join:
-  - 192.0.2.11
-key_b64: ""
+gossip:
+  # base64 of a 16, 24 or 32 byte key. The value below decodes to the 32 ASCII
+  # bytes "example-key-not-a-secret-32bytes" — a documentation placeholder, not a
+  # secret. Generate a real one with: openssl rand -base64 32
+  key: "ZXhhbXBsZS1rZXktbm90LWEtc2VjcmV0LTMyYnl0ZXM="
+  bind_port: 7946
+  join:
+    - 192.0.2.11
 
 listen_metrics: ":9414"
 

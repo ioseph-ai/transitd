@@ -37,7 +37,8 @@ turning your routers into a Kubernetes cluster:
       preference is recorded and surfaced, not applied. Mutation batches
       (act: neighbor shutdown, tcp-mss clamp) exist and are idempotent, but
       are deliberately NOT wired to decide yet — observe-only until the
-      wiring is review-carded. Remaining P1 core: act wiring (issue #4).
+      wiring is review-carded. Remaining P1 core: wiring the landed act
+      batches (#37) into the decide loop (no open tracking issue).
 - [ ] P2: automatic latency/loss-aware transit preference with
       hysteresis + minimum dwell.
 - [ ] P3: traffic engineering — per-prefix-class preferences, scheduled
